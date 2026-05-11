@@ -1,13 +1,22 @@
 # DefactoAI
 
-Shared LLM, embeddings and similarity-search building blocks for Defacto
-apps.
+A small, opinionated Elixir library for taking structured output from
+OpenAI-compatible LLMs, generating and storing embeddings, and running
+similarity search over them.
 
-This package extracts the universal pieces of [Detroit](../detroit)'s
-in-house AI client (introduced in PR #17919) into a stand-alone Mix
-dependency so the same machinery can be reused across Detroit,
-[Quizmass](../quizmass), and any other Defacto Elixir/Phoenix app
-without copy-paste.
+Built around three ideas:
+
+  - **Strategy fallback** for structured output — try tool calling first,
+    fall back to JSON mode, then plain-text-with-repair, so the same
+    response schema works against providers with very different feature
+    sets.
+  - **JSON repair + validation retry** — strip code fences, repair
+    trailing commas / smart quotes, slice JSON out of prose, then cast
+    through an Ecto changeset; on validation failure, append a corrective
+    user message and re-run.
+  - **Provider as a protocol, not a struct** — consumers implement
+    `DefactoAI.Provider` on their own Ecto schema (or any struct), so the
+    library never owns the host app's provider data.
 
 ## What's in the box
 
@@ -28,19 +37,17 @@ without copy-paste.
 
 ## Installation
 
-This is a path-dep package; it is not yet on Hex. While iterating, host
-apps consume it via:
-
 ```elixir
 # in mix.exs
-{:defacto_ai, path: "../defacto_ai"}
+def deps do
+  [
+    {:defacto_ai, github: "defacto-software/defacto_ai", ref: "<sha>"}
+  ]
+end
 ```
 
-Once the API is stable it will be pushed to `DefactoSoftware/defacto_ai`
-and consumers will switch to a git dep with a pinned ref.
-
-If your host app uses the embeddings / similarity-search modules, also
-add `pgvector`:
+If you use the embeddings / similarity-search modules, also add
+`pgvector`:
 
 ```elixir
 {:pgvector, "~> 0.3"}
@@ -298,21 +305,6 @@ mix format
 
 ## Status
 
-| Phase 1 — build the package |
-|---|
-| ✅ Strategy / JSON / RepairLoop / LangChainAdapter |
-| ✅ Provider protocol |
-| ✅ Client behaviour + LangChain implementation |
-| ✅ Client.Stub |
-| ✅ PromptRenderer |
-| ✅ Embeddings: Chunker, RateLimiter, schema, HTTP client, context |
-| ✅ SimilaritySearch |
-| ✅ `mix defacto_ai.gen.migration` |
-| ✅ Telemetry events |
-| ✅ Test suite (89 tests) |
-| ✅ README usage docs |
-
-| Next phases |
-|---|
-| ⬜ Detroit cutover — add path dep, port call sites |
-| ⬜ Quizmass cutover — drop Instructor, port call sites, add embeddings/RAG |
+Pre-1.0; the public API is stabilising. The library is in production
+use, but API breakage between minor versions is possible until a `1.0`
+tag is cut.

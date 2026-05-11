@@ -21,7 +21,8 @@ defmodule DefactoAI.Client.Stub do
       config :defacto_ai, :client, DefactoAI.Client.Stub
 
   Ships in `lib/` rather than `test/support/` so any consumer of
-  `defacto_ai` (Detroit, Quizmass, …) can use it without copying it.
+  `defacto_ai` can use it without copying the file or fiddling with
+  `elixirc_paths`.
   """
 
   @behaviour DefactoAI.Client

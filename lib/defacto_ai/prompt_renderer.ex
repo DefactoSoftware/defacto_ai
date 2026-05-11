@@ -19,8 +19,8 @@ defmodule DefactoAI.PromptRenderer do
   for tests and for hosts that bundle prompts outside `priv/`.
 
   Substitution is intentionally minimal — `{{key}}` becomes
-  `to_string(vars[key])` — to match the contract Detroit's call sites
-  already rely on. For richer templating, use EEx directly.
+  `to_string(vars[key])`. For richer templating (loops, conditionals,
+  HTML escaping), use EEx directly.
   """
 
   @default_dir "prompts"

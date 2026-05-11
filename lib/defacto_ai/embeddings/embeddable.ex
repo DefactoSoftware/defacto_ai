@@ -25,12 +25,10 @@ defmodule DefactoAI.Embeddings.Embeddable do
         def chunked?, do: true
       end
 
-  Detroit's original behaviour shipped a `strip_html/1` helper backed by
-  Floki via the `__using__` macro. That helper is intentionally not part
-  of this library — Floki is a heavy dependency and not every consumer
-  wants it. Hosts that need HTML stripping should implement it themselves
-  (e.g. as a tiny `MyApp.HtmlStripper` module) and call into it from
-  their `embedding_content/1` callbacks.
+  HTML / Markdown stripping and other content normalisation is the
+  host's responsibility — implement it in your `embedding_content/1`
+  callback. Keeping that out of the library means consumers don't have
+  to pull in Floki or any other parser they don't already use.
   """
 
   @doc """

@@ -15,10 +15,9 @@ defmodule DefactoAI.Embeddings do
     * `has_for?/1` — check whether any rows exist.
     * `nearest/2` — wrapper around `DefactoAI.Embedding.nearest_neighbors/2`.
 
-  Detroit's existing context (`Detroit.Embeddings`) layers Oban-based
-  scheduling, an embeddable-module registry and stats queries on top of
-  these primitives. That layer stays Detroit-specific — it's coupled to
-  Oban, which not every host has.
+  Async scheduling (e.g. via Oban), embeddable-module registries and
+  reporting queries are intentionally left to the host application —
+  those are domain concerns that don't belong in the library.
   """
 
   import Ecto.Query
