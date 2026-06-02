@@ -49,7 +49,7 @@ defmodule DefactoAI.RepairLoop do
   @spec run(LLMChain.t(), module(), decode_fun(), non_neg_integer(), keyword()) :: result()
   def run(%LLMChain{} = chain, schema_module, decode_fun, budget, opts \\ [])
       when is_atom(schema_module) and is_function(decode_fun, 1) do
-    case LLMChain.run(chain) do
+    case run_chain(chain, opts) do
       {:ok, new_chain} ->
         decode_and_validate(new_chain, schema_module, decode_fun, budget, opts)
 
@@ -63,6 +63,16 @@ defmodule DefactoAI.RepairLoop do
         {:error, other}
     end
   end
+
+  # Streaming requests go through DefactoAI.StreamRunner, whose tolerant SSE
+  # parser handles gateways (e.g. Heroku Inference) that LangChain's strict
+  # streaming parser chokes on (yielding an empty response). Non-streaming
+  # requests keep using LangChain's own runner.
+  defp run_chain(%LLMChain{llm: %{stream: true}} = chain, opts) do
+    DefactoAI.StreamRunner.run(chain, Keyword.take(opts, [:plug]))
+  end
+
+  defp run_chain(%LLMChain{} = chain, _opts), do: LLMChain.run(chain)
 
   defp decode_and_validate(chain, schema_module, decode_fun, budget, opts) do
     case decode_fun.(chain) do
@@ -165,7 +175,7 @@ defmodule DefactoAI.RepairLoop do
     cond do
       # Direct "thing X not supported" — the obvious case.
       msg =~
-          ~r/(tool[_\s]?choice|tool[_\s]?call|function[_\s]?call|response[_\s]?format|json[_\s]?(schema|object|response))/i and
+        ~r/(tool[_\s]?choice|tool[_\s]?call|function[_\s]?call|response[_\s]?format|json[_\s]?(schema|object|response))/i and
           msg =~ ~r/(not\s+(supported|allowed|valid)|unsupported|invalid|unrecognized|unknown)/i ->
         true
 

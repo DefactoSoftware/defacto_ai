@@ -322,6 +322,71 @@ defmodule DefactoAI.Client.LangChainTest do
     end
   end
 
+  describe "complete_structured/3 with streaming enabled" do
+    setup do
+      Application.put_env(:defacto_ai, :chat_stream, true)
+      on_exit(fn -> Application.delete_env(:defacto_ai, :chat_stream) end)
+      :ok
+    end
+
+    test "assembles streamed tool-call argument deltas into a struct",
+         %{bypass: bypass, base_url: url} do
+      sse_route(bypass, [
+        tool_call_open("respond", "call_1"),
+        tool_call_args(~s({"answer":)),
+        tool_call_args(~s("42"}))
+      ])
+
+      assert {:ok, %TestSchema{answer: "42"}} =
+               LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
+    test "tolerates tool-call chunks missing index/id fields",
+         %{bypass: bypass, base_url: url} do
+      sse_route(bypass, [
+        ~s({"choices":[{"delta":{"tool_calls":[{"function":{"name":"respond","arguments":"{\\"answer\\":\\"x\\"}"}}]}}]})
+      ])
+
+      assert {:ok, %TestSchema{answer: "x"}} =
+               LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
+    test "assembles streamed content for the JSON-mode strategy",
+         %{bypass: bypass, base_url: url} do
+      sse_route(bypass, [chunk_json(~s({"answer":)), chunk_json(~s("hi"}))])
+
+      assert {:ok, %TestSchema{answer: "hi"}} =
+               LangChain.complete_structured(TestSchema, messages(),
+                 provider: provider(url),
+                 strategies: [DefactoAI.Strategy.JsonMode]
+               )
+    end
+  end
+
+  defp tool_call_open(name, id) do
+    Jason.encode!(%{
+      choices: [
+        %{
+          index: 0,
+          delta: %{
+            role: "assistant",
+            tool_calls: [
+              %{index: 0, id: id, type: "function", function: %{name: name, arguments: ""}}
+            ]
+          }
+        }
+      ]
+    })
+  end
+
+  defp tool_call_args(arguments) do
+    Jason.encode!(%{
+      choices: [
+        %{index: 0, delta: %{tool_calls: [%{index: 0, function: %{arguments: arguments}}]}}
+      ]
+    })
+  end
+
   defp chunk_json(content) do
     Jason.encode!(%{
       id: "chatcmpl-test",
