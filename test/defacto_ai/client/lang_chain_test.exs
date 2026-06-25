@@ -220,6 +220,38 @@ defmodule DefactoAI.Client.LangChainTest do
                LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
     end
 
+    test "re-sends corrective retries without null content for strict providers",
+         %{bypass: bypass, base_url: url} do
+      # A forced tool call returns an assistant message with null content. On
+      # the corrective retry the whole turn is re-sent, and a strict provider
+      # rejects `"content": null` with a 400 ("messages[1]: content is
+      # required"). The repair loop must coerce that to "" so the retry lands.
+      counter = :atomics.new(1, [])
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        body = Jason.decode!(raw)
+        idx = :atomics.add_get(counter, 1, 1) - 1
+
+        has_null_content? =
+          Enum.any?(body["messages"] || [], &(Map.get(&1, "content") == nil))
+
+        {status, resp_body, content_type} =
+          cond do
+            has_null_content? -> api_error(400, "messages[1]: content is required")
+            idx == 0 -> ok(openai_tool_call_response(:empty))
+            true -> ok(openai_tool_call_response("after-repair"))
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type(content_type)
+        |> Plug.Conn.resp(status, resp_body)
+      end)
+
+      assert {:ok, %TestSchema{answer: "after-repair"}} =
+               LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
     test "exhausts the retry budget and surfaces a validation error",
          %{bypass: bypass, base_url: url} do
       # budget = 2 means: initial call + 2 retries = 3 upstream calls

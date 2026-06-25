@@ -49,7 +49,7 @@ defmodule DefactoAI.RepairLoop do
   @spec run(LLMChain.t(), module(), decode_fun(), non_neg_integer(), keyword()) :: result()
   def run(%LLMChain{} = chain, schema_module, decode_fun, budget, opts \\ [])
       when is_atom(schema_module) and is_function(decode_fun, 1) do
-    case run_chain(chain, opts) do
+    case run_chain(ensure_message_content(chain), opts) do
       {:ok, new_chain} ->
         decode_and_validate(new_chain, schema_module, decode_fun, budget, opts)
 
@@ -73,6 +73,21 @@ defmodule DefactoAI.RepairLoop do
   end
 
   defp run_chain(%LLMChain{} = chain, _opts), do: LLMChain.run(chain)
+
+  # A forced tool call comes back as an assistant message with `nil` content
+  # (the payload lives in `tool_calls`). When the repair loop re-sends that
+  # turn on a corrective retry, LangChain serialises it as `"content": null`.
+  # The OpenAI spec permits that alongside `tool_calls`, but some
+  # OpenAI-compatible providers are stricter and reject it with a 400 like
+  # `messages[1]: content is required`. Coerce `nil` content to "" so the
+  # message history round-trips on those providers without losing the tool
+  # calls or our retry budget.
+  defp ensure_message_content(%LLMChain{messages: messages} = chain) do
+    %{chain | messages: Enum.map(messages, &fill_blank_content/1)}
+  end
+
+  defp fill_blank_content(%Message{content: nil} = message), do: %{message | content: ""}
+  defp fill_blank_content(%Message{} = message), do: message
 
   defp decode_and_validate(chain, schema_module, decode_fun, budget, opts) do
     case decode_fun.(chain) do
