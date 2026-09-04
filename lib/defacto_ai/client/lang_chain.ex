@@ -236,8 +236,8 @@ defmodule DefactoAI.Client.LangChain do
       {:ok, %Req.Response{status: 200}} ->
         send(caller, {ref, :done})
 
-      {:ok, %Req.Response{status: status, body: body}} ->
-        send(caller, {ref, {:error, {:api_error, status, body_to_text(body)}}})
+      {:ok, %Req.Response{status: status} = resp} ->
+        send(caller, {ref, {:error, {:api_error, status, error_body(resp)}}})
 
       {:error, exception} ->
         send(caller, {ref, {:error, {:http_error, http_error_reason(exception)}}})
@@ -248,16 +248,36 @@ defmodule DefactoAI.Client.LangChain do
   # `{req, resp}` threaded through. We buffer any incomplete trailing
   # SSE line on the response's private dict so it can be re-joined with
   # the next chunk's data — SSE lines may straddle chunk boundaries.
+  #
+  # Non-200 responses carry a plain (usually JSON) error body rather than
+  # SSE, which the `data:`-line parser would silently discard. Buffer those
+  # bytes verbatim instead so the provider's message reaches the caller.
   defp stream_collector(caller, ref) do
-    fn {:data, data}, {req, resp} ->
-      buffer = Req.Response.get_private(resp, :sse_buffer, "")
-      {chunks, new_buffer} = parse_sse_chunks(buffer <> data)
+    fn
+      {:data, data}, {req, %Req.Response{status: 200} = resp} ->
+        buffer = Req.Response.get_private(resp, :sse_buffer, "")
+        {chunks, new_buffer} = parse_sse_chunks(buffer <> data)
 
-      for content <- chunks do
-        send(caller, {ref, {:chunk, content}})
-      end
+        for content <- chunks do
+          send(caller, {ref, {:chunk, content}})
+        end
 
-      {:cont, {req, Req.Response.put_private(resp, :sse_buffer, new_buffer)}}
+        {:cont, {req, Req.Response.put_private(resp, :sse_buffer, new_buffer)}}
+
+      {:data, data}, {req, resp} ->
+        {:cont, {req, append_error_body(resp, data)}}
+    end
+  end
+
+  defp append_error_body(resp, data) do
+    buffered = Req.Response.get_private(resp, :error_body, "")
+    Req.Response.put_private(resp, :error_body, buffered <> data)
+  end
+
+  defp error_body(%Req.Response{body: body} = resp) do
+    case Req.Response.get_private(resp, :error_body, "") do
+      "" -> body_to_text(body)
+      text -> text
     end
   end
 
