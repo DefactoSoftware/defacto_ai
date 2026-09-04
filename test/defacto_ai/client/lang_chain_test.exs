@@ -337,6 +337,29 @@ defmodule DefactoAI.Client.LangChainTest do
       assert [{:error, {:api_error, 500, _}}] = Enum.take(stream, 5)
     end
 
+    test "preserves the provider's error body on non-200 responses" do
+      # Heroku Inference answers a bad image URL with a 422 and a JSON error
+      # body. The SSE collector only reads `data:` lines, so without buffering
+      # the raw body the caller would see {:api_error, 422, ""}.
+      body =
+        ~s({"error":{"code":422,"message":"failed to fetch image; check the url provided is valid","type":"unprocessable_entity"}})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(422, body)
+      end)
+
+      assert {:ok, stream} =
+               LangChain.stream_chat(
+                 [%{role: "user", content: "x"}],
+                 provider: TestProvider.new(),
+                 plug: {Req.Test, __MODULE__}
+               )
+
+      assert [{:error, {:api_error, 422, ^body}}] = Enum.take(stream, 5)
+    end
+
     test "drops chunks that don't contain content", %{bypass: bypass, base_url: url} do
       sse_route(bypass, [
         ~s({"choices":[{"delta":{"role":"assistant"}}]}),
