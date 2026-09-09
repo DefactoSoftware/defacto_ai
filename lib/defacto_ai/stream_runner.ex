@@ -20,12 +20,19 @@ defmodule DefactoAI.StreamRunner do
   `decode_payload/1` and the repair loop work unchanged.
   """
 
+  require Logger
+
   alias LangChain.Chains.LLMChain
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Message
   alias LangChain.Message.ToolCall
 
   @default_timeout 180_000
+
+  # Diagnostics for unrecognised tool-call chunk shapes: how many raw chunks
+  # to keep and how long each may be when logged.
+  @raw_delta_sample_size 5
+  @raw_delta_max_chars 300
 
   @doc """
   Run a prepared streaming chain. Mirrors `LLMChain.run/1`'s return shape:
@@ -97,7 +104,20 @@ defmodule DefactoAI.StreamRunner do
     end
   end
 
-  defp empty_state, do: %{buffer: "", content: "", tool_calls: %{}}
+  # `current_index` is the slot of the most recently started tool call, so
+  # argument deltas that arrive without a usable `index` can be attached to
+  # it. `raw_tool_deltas` keeps the first few tool-call chunks verbatim for
+  # diagnostics only; they never leave `build_message/1`.
+  defp empty_state do
+    %{
+      buffer: "",
+      content: "",
+      tool_calls: %{},
+      current_index: nil,
+      raw_tool_deltas: [],
+      raw_tool_delta_count: 0
+    }
+  end
 
   defp consume(state, data) do
     {lines, buffer} = split_lines(state.buffer <> data)
@@ -126,41 +146,142 @@ defmodule DefactoAI.StreamRunner do
 
   defp apply_line(_, state), do: state
 
-  defp apply_json(state, {:ok, %{"choices" => [%{"delta" => delta} | _]}}) when is_map(delta) do
-    state
-    |> merge_content(delta["content"])
-    |> merge_tool_calls(delta["tool_calls"])
-  end
+  # Standard OpenAI streaming puts partial content in `choices[0].delta`.
+  # Some gateways also emit a complete `choices[0].message` (the non-delta
+  # form) inside the stream; treat its tool calls as finished.
+  defp apply_json(state, {:ok, %{"choices" => [%{"delta" => delta} | _]}}) when is_map(delta),
+    do: merge_choice(state, delta, :delta)
+
+  defp apply_json(state, {:ok, %{"choices" => [%{"message" => message} | _]}})
+       when is_map(message),
+       do: merge_choice(state, message, :complete)
 
   defp apply_json(state, _), do: state
+
+  defp merge_choice(state, choice, mode) do
+    state
+    |> merge_content(choice["content"])
+    |> merge_tool_calls(choice["tool_calls"], mode)
+    |> merge_function_call(choice["function_call"], mode)
+  end
 
   defp merge_content(state, content) when is_binary(content),
     do: %{state | content: state.content <> content}
 
   defp merge_content(state, _), do: state
 
-  defp merge_tool_calls(state, calls) when is_list(calls),
-    do: Enum.reduce(calls, state, &merge_tool_call/2)
+  defp merge_tool_calls(state, calls, mode) when is_list(calls),
+    do: Enum.reduce(calls, state, &merge_tool_call(&2, &1, mode))
 
-  defp merge_tool_calls(state, _), do: state
+  defp merge_tool_calls(state, _, _mode), do: state
 
-  defp merge_tool_call(call, state) do
-    index = call["index"] || 0
+  # Legacy `function_call` shape: a single call without id or index. Treat it
+  # as tool call index 0.
+  defp merge_function_call(state, %{} = function_call, mode),
+    do: merge_tool_call(state, %{"index" => 0, "function" => function_call}, mode)
+
+  defp merge_function_call(state, _, _mode), do: state
+
+  # Tool-call chunks are not uniformly shaped across gateways. OpenAI sends
+  # every chunk with an `index`. Anthropic-backed gateways (e.g. Heroku
+  # Inference) open the call with `index`/`id`/`function.name` and then send
+  # argument deltas with a missing or different `index`, which used to land in
+  # a separate, nameless slot — leaving the real call with empty arguments.
+  # Resolve the slot a chunk belongs to before merging.
+  defp merge_tool_call(state, call, mode) when is_map(call) do
+    index = target_index(state, call, mode)
     fun = call["function"] || %{}
     existing = Map.get(state.tool_calls, index, %{name: nil, call_id: nil, arguments: ""})
 
     updated = %{
       name: existing.name || fun["name"],
       call_id: existing.call_id || call["id"],
-      arguments: existing.arguments <> (fun["arguments"] || "")
+      arguments: merge_arguments(existing.arguments, fun["arguments"], mode)
     }
 
-    %{state | tool_calls: Map.put(state.tool_calls, index, updated)}
+    %{state | tool_calls: Map.put(state.tool_calls, index, updated), current_index: index}
+    |> remember_raw_delta(call)
+  end
+
+  defp merge_tool_call(state, _call, _mode), do: state
+
+  defp target_index(state, call, mode) do
+    index = call["index"]
+    fun = call["function"] || %{}
+    opens_call? = is_binary(call["id"]) or is_binary(fun["name"])
+    current = state.current_index && Map.get(state.tool_calls, state.current_index)
+
+    cond do
+      # Explicit index pointing at a call we already opened and not visibly a
+      # different call: the standard OpenAI shape.
+      is_integer(index) and Map.has_key?(state.tool_calls, index) and
+          same_call?(state.tool_calls[index], call) ->
+        index
+
+      # A new call opening at an explicit, still-free index.
+      is_integer(index) and opens_call? and not Map.has_key?(state.tool_calls, index) ->
+        index
+
+      # No usable index (nil, or a slot that was never opened): continue the
+      # most recently opened call unless the chunk clearly names another one.
+      current != nil and continues?(current, call, mode) ->
+        state.current_index
+
+      # Anything else that names a call opens a new slot.
+      opens_call? ->
+        next_index(state)
+
+      # Orphan argument delta before any call opened.
+      is_integer(index) ->
+        index
+
+      true ->
+        0
+    end
+  end
+
+  # A chunk carrying an id different from the slot's id belongs to another call.
+  defp same_call?(%{call_id: existing_id}, call) do
+    call["id"] == nil or existing_id == nil or call["id"] == existing_id
+  end
+
+  defp continues?(current, call, mode) do
+    fun = call["function"] || %{}
+
+    cond do
+      is_binary(call["id"]) -> call["id"] == current.call_id
+      # Gateways may repeat the function name on every delta of one call; a
+      # complete (non-delta) message naming a tool is a whole new call.
+      is_binary(fun["name"]) -> mode == :delta and fun["name"] == current.name
+      true -> true
+    end
+  end
+
+  defp next_index(%{tool_calls: tool_calls}) when map_size(tool_calls) == 0, do: 0
+  defp next_index(%{tool_calls: tool_calls}), do: Enum.max(Map.keys(tool_calls)) + 1
+
+  # Deltas concatenate; a complete (non-delta) message carries the whole
+  # argument string and replaces any partial text already collected.
+  defp merge_arguments(existing, nil, _mode), do: existing
+  defp merge_arguments(existing, args, :delta) when is_binary(args), do: existing <> args
+  defp merge_arguments(existing, "", :complete), do: existing
+  defp merge_arguments(_existing, args, :complete) when is_binary(args), do: args
+  defp merge_arguments(existing, _args, _mode), do: existing
+
+  defp remember_raw_delta(state, call) do
+    deltas =
+      if length(state.raw_tool_deltas) < @raw_delta_sample_size,
+        do: state.raw_tool_deltas ++ [call],
+        else: state.raw_tool_deltas
+
+    %{state | raw_tool_deltas: deltas, raw_tool_delta_count: state.raw_tool_delta_count + 1}
   end
 
   # --- Message assembly ---
 
   defp build_message(state) do
+    maybe_log_empty_arguments(state)
+
     %Message{
       role: :assistant,
       status: :complete,
@@ -168,6 +289,32 @@ defmodule DefactoAI.StreamRunner do
       tool_calls: build_tool_calls(state.tool_calls)
     }
   end
+
+  # A tool call that finished with no arguments while the reply also has no
+  # content means we did not recognise the gateway's argument-delta shape.
+  # Log a bounded sample of the raw chunks so the real shape shows up in
+  # production logs instead of just "validation failed".
+  defp maybe_log_empty_arguments(%{content: "", tool_calls: tool_calls} = state)
+       when map_size(tool_calls) > 0 do
+    if Enum.any?(tool_calls, fn {_index, call} -> call.arguments == "" end) do
+      sample =
+        state.raw_tool_deltas
+        |> Enum.map(&truncate(inspect(&1), @raw_delta_max_chars))
+        |> Enum.join(" | ")
+
+      Logger.info(fn ->
+        "DefactoAI.StreamRunner: streamed tool call finished with empty arguments; " <>
+          "#{state.raw_tool_delta_count} raw tool-call chunk(s) seen, sample: #{sample}"
+      end)
+    end
+
+    :ok
+  end
+
+  defp maybe_log_empty_arguments(_state), do: :ok
+
+  defp truncate(text, max) when byte_size(text) <= max, do: text
+  defp truncate(text, max), do: String.slice(text, 0, max - 1) <> "…"
 
   defp build_tool_calls(tool_calls) do
     tool_calls

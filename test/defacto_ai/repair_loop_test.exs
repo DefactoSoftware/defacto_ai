@@ -17,6 +17,7 @@ defmodule DefactoAI.RepairLoopTest do
   alias LangChain.Chains.LLMChain
   alias LangChain.Message
   alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
 
   @placeholder "(structured response provided as a tool call)"
 
@@ -177,6 +178,58 @@ defmodule DefactoAI.RepairLoopTest do
       assistant = Enum.find(messages, &(&1["role"] == "assistant"))
       assert assistant["content"] == ""
       refute Enum.any?(messages, &(&1["content"] == @placeholder))
+    end
+  end
+
+  # Wire content may be a plain string or a list of text parts.
+  defp text_of(content) when is_binary(content), do: content
+  defp text_of(parts) when is_list(parts), do: Enum.map_join(parts, "", &part_text/1)
+
+  defp part_text(%{"text" => text}), do: text
+  defp part_text(%LangChain.Message.ContentPart{content: text}) when is_binary(text), do: text
+  defp part_text(_), do: ""
+
+  describe "run/5 — corrective turn after a rejected tool call" do
+    test "answers the tool call with a tool result before the corrective user message" do
+      stub_upstream([~s({"wrong":"x"}), ~s({"answer":"42"})])
+
+      assert {:ok, %TestSchema{answer: "42"}} = run(chain(), 1)
+
+      # First request is the initial turn; the second carries the retry history.
+      assert_received {:request, %{"messages" => _initial}}
+      assert_received {:request, %{"messages" => messages}}
+
+      [assistant, tool, user] = Enum.take(messages, -3)
+
+      assert assistant["role"] == "assistant"
+      assert [%{"id" => "call_2", "function" => %{"name" => "respond"}}] = assistant["tool_calls"]
+
+      assert tool["role"] == "tool"
+      assert tool["tool_call_id"] == "call_2"
+      assert text_of(tool["content"]) =~ "answer: can't be blank"
+
+      assert user["role"] == "user"
+      assert text_of(user["content"]) =~ "could not be used"
+    end
+
+    test "builds one is_error tool result per tool call, then the user message" do
+      changeset = TestSchema.changeset(%TestSchema{}, %{})
+
+      assert [
+               %Message{role: :tool, tool_results: [result]},
+               %Message{role: :user}
+             ] = RepairLoop.corrective_messages(chain([tool_call_turn(nil)]), changeset, %{})
+
+      assert %ToolResult{tool_call_id: "call_1", name: "respond", is_error: true} = result
+      assert text_of(result.content) =~ "answer: can't be blank"
+    end
+
+    test "sends only the corrective user message when the last answer was not a tool call" do
+      changeset = TestSchema.changeset(%TestSchema{}, %{})
+      plain = %Message{role: :assistant, status: :complete, content: "not json", tool_calls: []}
+
+      assert [%Message{role: :user}] =
+               RepairLoop.corrective_messages(chain([plain]), changeset, "not json")
     end
   end
 

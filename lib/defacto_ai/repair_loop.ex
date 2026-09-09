@@ -16,6 +16,8 @@ defmodule DefactoAI.RepairLoop do
   alias LangChain.Chains.LLMChain
   alias LangChain.LangChainError
   alias LangChain.Message
+  alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
 
   @type decode_fun :: (LLMChain.t() -> {:ok, map() | binary()} | {:error, term()})
   @type result :: {:ok, struct()} | {:error, term()}
@@ -129,7 +131,7 @@ defmodule DefactoAI.RepairLoop do
             )
 
             chain
-            |> LLMChain.add_message(corrective_message(validation_error, payload))
+            |> add_corrective_turn(validation_error, payload)
             |> run(schema_module, decode_fun, budget - 1, opts)
 
           {:error, validation_error} ->
@@ -140,6 +142,51 @@ defmodule DefactoAI.RepairLoop do
         {:error, {:decode_failed, decode_error}}
     end
   end
+
+  @doc false
+  # The messages appended to the chain before a retry. Public (but hidden)
+  # so the exact shape can be asserted in tests; hosts should not call it.
+  #
+  # Both OpenAI and Anthropic (behind OpenAI-compatible gateways such as
+  # Heroku Inference) require that an assistant message carrying tool calls
+  # is immediately followed by one tool result per call; Anthropic rejects
+  # the history otherwise with `tool_use ids were found without tool_result
+  # blocks immediately after`. So when the rejected answer was a tool call,
+  # answer every call with an error tool result first, then append the
+  # corrective user message. Without tool calls only the user message is sent.
+  @spec corrective_messages(LLMChain.t(), term(), term()) :: [Message.t()]
+  def corrective_messages(%LLMChain{last_message: last}, error, payload) do
+    tool_results(last, error) ++ [corrective_message(error, payload)]
+  end
+
+  defp add_corrective_turn(chain, error, payload) do
+    chain
+    |> corrective_messages(error, payload)
+    |> Enum.reduce(chain, &LLMChain.add_message(&2, &1))
+  end
+
+  defp tool_results(%Message{role: :assistant, tool_calls: [_ | _] = calls}, error) do
+    # A call without an id cannot be answered (and would be rejected by the
+    # provider on its own anyway), so it is skipped rather than raising here.
+    results =
+      for %ToolCall{call_id: call_id, name: name} <- calls, is_binary(call_id) do
+        ToolResult.new!(%{
+          tool_call_id: call_id,
+          name: name,
+          content:
+            "Rejected: #{describe_error(error)}. " <>
+              "A corrected response is requested in the next message.",
+          is_error: true
+        })
+      end
+
+    case results do
+      [] -> []
+      results -> [Message.new_tool_result!(%{tool_results: results})]
+    end
+  end
+
+  defp tool_results(_last, _error), do: []
 
   defp corrective_message(error, payload) do
     Message.new_user!("""
