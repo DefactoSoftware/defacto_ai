@@ -20,7 +20,7 @@ defmodule DefactoAI.Strategy.ToolCall do
   @tool_name "respond"
 
   @impl true
-  def prepare(provider, schema_module, messages, _opts) do
+  def prepare(provider, schema_module, messages, opts) do
     with {:ok, parameters_schema} <- fetch_parameters_schema(schema_module) do
       tool =
         Function.new!(%{
@@ -35,8 +35,10 @@ defmodule DefactoAI.Strategy.ToolCall do
         })
 
       chat_model =
-        LangChainAdapter.build_chat_model(provider,
-          tool_choice: %{"type" => "function", "function" => %{"name" => @tool_name}}
+        LangChainAdapter.build_chat_model(
+          provider,
+          [tool_choice: %{"type" => "function", "function" => %{"name" => @tool_name}}],
+          opts
         )
 
       chain =
@@ -54,9 +56,22 @@ defmodule DefactoAI.Strategy.ToolCall do
   def decode_payload(%LangChain.Chains.LLMChain{last_message: message}) do
     case message.tool_calls || [] do
       [] -> {:error, :no_tool_call}
-      [first | _] -> extract_arguments(first)
+      calls -> calls |> pick_tool_call() |> extract_arguments()
     end
   end
+
+  # Streaming gateways can leave a stray tool call next to the real one (an
+  # opening chunk whose arguments landed elsewhere, or a second call the
+  # model added). Prefer the `respond` call that actually carries arguments,
+  # then any `respond` call, then whatever came first.
+  defp pick_tool_call(calls) do
+    Enum.find(calls, &(respond?(&1) and is_map(&1.arguments) and map_size(&1.arguments) > 0)) ||
+      Enum.find(calls, &respond?/1) ||
+      hd(calls)
+  end
+
+  defp respond?(%LangChain.Message.ToolCall{name: @tool_name}), do: true
+  defp respond?(_), do: false
 
   defp extract_arguments(%LangChain.Message.ToolCall{name: @tool_name, arguments: args})
        when is_map(args),

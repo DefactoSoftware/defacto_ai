@@ -97,6 +97,86 @@ defmodule DefactoAI.StreamRunnerTest do
                tool_calls
     end
 
+    test "treats a blank function name on argument deltas as absent (Heroku Inference shape)" do
+      # Ground truth from a live probe: frames are `event: message` +
+      # `data: {...}`, the opening chunk carries index/id/name, and every
+      # argument delta repeats `"name": ""`.
+      frames =
+        [
+          %{
+            delta: %{
+              tool_calls: [
+                %{
+                  index: 0,
+                  id: "tooluse_1",
+                  type: "function",
+                  function: %{name: "respond", arguments: ""}
+                }
+              ]
+            },
+            index: 0
+          },
+          %{
+            delta: %{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s({"ans)}}]},
+            index: 0
+          },
+          %{
+            delta: %{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s(wer":"42"})}}]},
+            index: 0
+          }
+        ]
+        |> Enum.map(&%{choices: [&1]})
+        |> Enum.map(&Jason.encode!/1)
+        |> Enum.map_join("", &"event: message\ndata: #{&1}\n\n")
+        |> Kernel.<>("event: message\ndata: [DONE]\n\n")
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, frames)
+      end)
+
+      assert {:ok, %LLMChain{last_message: %Message{tool_calls: tool_calls}}} =
+               StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+
+      assert [%ToolCall{call_id: "tooluse_1", name: "respond", arguments: %{"answer" => "42"}}] =
+               tool_calls
+    end
+
+    test "merges deltas onto the started call when a text block shifts their index" do
+      # Anthropic content-block indexes: text block 0, tool_use block 1. The
+      # gateway opens the call at index 1 but streams argument deltas at 0.
+      tool_calls =
+        run_tool_calls([
+          delta(%{content: "Here you go: "}),
+          opening_chunk(1, "tooluse_1", "respond"),
+          delta(%{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s({"answer":)}}]}),
+          delta(%{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s("42"})}}]})
+        ])
+
+      assert [
+               %ToolCall{
+                 index: 1,
+                 call_id: "tooluse_1",
+                 name: "respond",
+                 arguments: %{"answer" => "42"}
+               }
+             ] =
+               tool_calls
+    end
+
+    test "folds argument deltas that arrived before the call opened into it" do
+      tool_calls =
+        run_tool_calls([
+          delta(%{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s({"answer":)}}]}),
+          opening_chunk(1, "tooluse_1", "respond"),
+          delta(%{tool_calls: [%{index: 0, function: %{name: "", arguments: ~s("42"})}}]})
+        ])
+
+      assert [%ToolCall{call_id: "tooluse_1", name: "respond", arguments: %{"answer" => "42"}}] =
+               tool_calls
+    end
+
     test "keeps properly indexed parallel tool calls apart" do
       tool_calls =
         run_tool_calls([
