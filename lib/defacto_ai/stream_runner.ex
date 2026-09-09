@@ -104,16 +104,17 @@ defmodule DefactoAI.StreamRunner do
     end
   end
 
-  # `current_index` is the slot of the most recently started tool call, so
-  # argument deltas that arrive without a usable `index` can be attached to
-  # it. `raw_tool_deltas` keeps the first few tool-call chunks verbatim for
-  # diagnostics only; they never leave `build_message/1`.
+  # `last_started` is the slot of the most recently *started* tool call (one
+  # that received an id or a name), so argument deltas without a usable
+  # `index` can be attached to it. `raw_tool_deltas` keeps the first few
+  # tool-call chunks verbatim for diagnostics only; they never leave
+  # `build_message/1`.
   defp empty_state do
     %{
       buffer: "",
       content: "",
       tool_calls: %{},
-      current_index: nil,
+      last_started: nil,
       raw_tool_deltas: [],
       raw_tool_delta_count: 0
     }
@@ -184,14 +185,17 @@ defmodule DefactoAI.StreamRunner do
 
   # Tool-call chunks are not uniformly shaped across gateways. OpenAI sends
   # every chunk with an `index`. Anthropic-backed gateways (e.g. Heroku
-  # Inference) open the call with `index`/`id`/`function.name` and then send
-  # argument deltas with a missing or different `index`, which used to land in
-  # a separate, nameless slot — leaving the real call with empty arguments.
-  # Resolve the slot a chunk belongs to before merging.
+  # Inference) open the call with `index`/`id`/`function.name` and then stream
+  # argument deltas whose `function.name` is `""` and whose `index` is the
+  # Anthropic *content-block* index — so a text block preceding the tool_use
+  # puts the deltas on a different index than the opening chunk. Keying purely
+  # on `index` left the real call with empty arguments. Resolve the slot a
+  # chunk belongs to before merging.
   defp merge_tool_call(state, call, mode) when is_map(call) do
+    call = normalise_call(call)
     index = target_index(state, call, mode)
-    fun = call["function"] || %{}
-    existing = Map.get(state.tool_calls, index, %{name: nil, call_id: nil, arguments: ""})
+    fun = call["function"]
+    existing = Map.get(state.tool_calls, index, empty_slot())
 
     updated = %{
       name: existing.name || fun["name"],
@@ -199,44 +203,69 @@ defmodule DefactoAI.StreamRunner do
       arguments: merge_arguments(existing.arguments, fun["arguments"], mode)
     }
 
-    %{state | tool_calls: Map.put(state.tool_calls, index, updated), current_index: index}
+    %{state | tool_calls: Map.put(state.tool_calls, index, updated)}
+    |> adopt_orphans(index, updated)
+    |> note_started(index, updated)
     |> remember_raw_delta(call)
   end
 
   defp merge_tool_call(state, _call, _mode), do: state
 
+  defp empty_slot, do: %{name: nil, call_id: nil, arguments: ""}
+
+  # Blank ids/names (`""` on Heroku's argument deltas) mean "not given"; they
+  # must never open a call or overwrite a real name.
+  defp normalise_call(call) do
+    fun = call["function"] || %{}
+
+    call
+    |> Map.put("id", blank_to_nil(call["id"]))
+    |> Map.put("function", Map.put(fun, "name", blank_to_nil(fun["name"])))
+  end
+
+  defp blank_to_nil(value) when is_binary(value) and value != "", do: value
+  defp blank_to_nil(_), do: nil
+
+  defp opens_call?(call), do: call["id"] != nil or call["function"]["name"] != nil
+
+  # A slot is started once a chunk gave it an id or a name. Slots holding
+  # only arguments are orphans waiting for their call to open.
+  defp started?(%{call_id: call_id, name: name}), do: call_id != nil or name != nil
+
   defp target_index(state, call, mode) do
     index = call["index"]
-    fun = call["function"] || %{}
-    opens_call? = is_binary(call["id"]) or is_binary(fun["name"])
-    current = state.current_index && Map.get(state.tool_calls, state.current_index)
+    at_index = is_integer(index) && Map.get(state.tool_calls, index)
+    last_started = state.last_started && Map.get(state.tool_calls, state.last_started)
 
     cond do
-      # Explicit index pointing at a call we already opened and not visibly a
-      # different call: the standard OpenAI shape.
-      is_integer(index) and Map.has_key?(state.tool_calls, index) and
-          same_call?(state.tool_calls[index], call) ->
+      # Pure argument delta (no id, no non-empty name). An explicit index
+      # pointing at a started call is honoured (standard OpenAI shape);
+      # otherwise it continues the most recently started call regardless of
+      # its index; before any call opened it parks in an orphan slot.
+      not opens_call?(call) ->
+        cond do
+          at_index && started?(at_index) -> index
+          last_started != nil -> state.last_started
+          is_integer(index) -> index
+          true -> 0
+        end
+
+      # The chunk names a call. Landing on an existing slot that is not
+      # visibly another call (repeated id/name, or an orphan slot) merges.
+      at_index && same_call?(at_index, call) ->
         index
 
-      # A new call opening at an explicit, still-free index.
-      is_integer(index) and opens_call? and not Map.has_key?(state.tool_calls, index) ->
-        index
-
-      # No usable index (nil, or a slot that was never opened): continue the
-      # most recently opened call unless the chunk clearly names another one.
-      current != nil and continues?(current, call, mode) ->
-        state.current_index
-
-      # Anything else that names a call opens a new slot.
-      opens_call? ->
-        next_index(state)
-
-      # Orphan argument delta before any call opened.
+      # A free explicit index opens there.
       is_integer(index) ->
         index
 
+      # No usable index: continue the last started call when this is visibly
+      # the same one, otherwise open a new slot.
+      last_started != nil and continues?(last_started, call, mode) ->
+        state.last_started
+
       true ->
-        0
+        next_index(state)
     end
   end
 
@@ -245,15 +274,13 @@ defmodule DefactoAI.StreamRunner do
     call["id"] == nil or existing_id == nil or call["id"] == existing_id
   end
 
-  defp continues?(current, call, mode) do
-    fun = call["function"] || %{}
-
-    cond do
-      is_binary(call["id"]) -> call["id"] == current.call_id
+  defp continues?(slot, call, mode) do
+    if call["id"] != nil do
+      call["id"] == slot.call_id
+    else
       # Gateways may repeat the function name on every delta of one call; a
       # complete (non-delta) message naming a tool is a whole new call.
-      is_binary(fun["name"]) -> mode == :delta and fun["name"] == current.name
-      true -> true
+      mode == :delta and call["function"]["name"] == slot.name
     end
   end
 
@@ -267,6 +294,29 @@ defmodule DefactoAI.StreamRunner do
   defp merge_arguments(existing, "", :complete), do: existing
   defp merge_arguments(_existing, args, :complete) when is_binary(args), do: args
   defp merge_arguments(existing, _args, _mode), do: existing
+
+  # Argument deltas that arrived before their call opened sit in orphan
+  # slots. Once the first — and only — started call exists, fold them into
+  # it in index order.
+  defp adopt_orphans(state, index, slot) do
+    {orphans, started} =
+      Enum.split_with(state.tool_calls, fn {_index, s} -> not started?(s) end)
+
+    if started?(slot) and orphans != [] and length(started) == 1 do
+      prefix =
+        orphans
+        |> Enum.sort_by(fn {orphan_index, _} -> orphan_index end)
+        |> Enum.map_join("", fn {_index, s} -> s.arguments end)
+
+      %{state | tool_calls: %{index => %{slot | arguments: prefix <> slot.arguments}}}
+    else
+      state
+    end
+  end
+
+  defp note_started(state, index, slot) do
+    if started?(slot), do: %{state | last_started: index}, else: state
+  end
 
   defp remember_raw_delta(state, call) do
     deltas =
@@ -316,8 +366,18 @@ defmodule DefactoAI.StreamRunner do
   defp truncate(text, max) when byte_size(text) <= max, do: text
   defp truncate(text, max), do: String.slice(text, 0, max - 1) <> "…"
 
+  # Orphan slots (arguments without id or name) are only meaningful when no
+  # call ever opened; once one did, whatever they hold was either adopted or
+  # is noise, so they are dropped.
   defp build_tool_calls(tool_calls) do
-    tool_calls
+    slots = Map.to_list(tool_calls)
+
+    slots =
+      if Enum.any?(slots, fn {_index, slot} -> started?(slot) end),
+        do: Enum.filter(slots, fn {_index, slot} -> started?(slot) end),
+        else: slots
+
+    slots
     |> Enum.sort_by(fn {index, _} -> index end)
     |> Enum.map(fn {index, tc} ->
       %ToolCall{

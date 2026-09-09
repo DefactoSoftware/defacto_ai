@@ -141,6 +141,38 @@ defmodule DefactoAI.StrategyTest do
     end
   end
 
+  describe "ToolCall.decode_payload/1 with several tool calls" do
+    test "prefers the respond call that carries arguments" do
+      chain = %LLMChain{
+        llm: %ChatOpenAI{},
+        last_message: %Message{
+          role: :assistant,
+          tool_calls: [
+            %ToolCall{name: "respond", call_id: "call_1", arguments: %{}},
+            %ToolCall{name: "respond", call_id: "call_2", arguments: %{"answer" => "42"}}
+          ]
+        }
+      }
+
+      assert {:ok, %{"answer" => "42"}} = Strategy.ToolCall.decode_payload(chain)
+    end
+
+    test "prefers a respond call over an unrelated tool call listed first" do
+      chain = %LLMChain{
+        llm: %ChatOpenAI{},
+        last_message: %Message{
+          role: :assistant,
+          tool_calls: [
+            %ToolCall{name: "other", call_id: "call_1", arguments: %{"x" => 1}},
+            %ToolCall{name: "respond", call_id: "call_2", arguments: %{"answer" => "42"}}
+          ]
+        }
+      }
+
+      assert {:ok, %{"answer" => "42"}} = Strategy.ToolCall.decode_payload(chain)
+    end
+  end
+
   describe "JsonMode.prepare/4" do
     test "enables json_response on the chat model" do
       assert {:ok, %LLMChain{llm: %ChatOpenAI{json_response: true}}} =

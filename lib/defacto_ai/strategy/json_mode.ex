@@ -13,8 +13,8 @@ defmodule DefactoAI.Strategy.JsonMode do
   alias DefactoAI.LangChainAdapter
 
   @impl true
-  def prepare(provider, schema_module, messages, _opts) do
-    chat_model = LangChainAdapter.build_chat_model(provider, json_response: true)
+  def prepare(provider, schema_module, messages, opts) do
+    chat_model = LangChainAdapter.build_chat_model(provider, [json_response: true], opts)
 
     chain = LangChainAdapter.build_chain(chat_model, prepend_system_prompt(messages, schema_module))
 

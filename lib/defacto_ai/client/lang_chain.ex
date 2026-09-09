@@ -80,6 +80,7 @@ defmodule DefactoAI.Client.LangChain do
 
       {:error, :unsupported} = error ->
         log_fallback(strategy, error)
+
         try_strategies(rest, provider, schema, messages, budget, opts, [{strategy, error} | errors])
 
       {:error, _} = error ->
@@ -148,7 +149,7 @@ defmodule DefactoAI.Client.LangChain do
   @impl true
   def complete_chat(messages, opts \\ []) do
     with {:ok, provider} <- resolve_provider(opts) do
-      chat_model = LangChainAdapter.build_chat_model(provider, stream: false)
+      chat_model = LangChainAdapter.build_chat_model(provider, [stream: false], opts)
 
       chat_model
       |> LangChainAdapter.build_chain(messages)
@@ -213,11 +214,13 @@ defmodule DefactoAI.Client.LangChain do
   defp run_stream_request(provider, messages, opts, caller, ref, timeout) do
     url = chat_endpoint(provider)
 
-    body = %{
-      model: Provider.model(provider),
-      messages: Enum.map(messages, &normalise_message/1),
-      stream: true
-    }
+    body =
+      %{
+        model: Provider.model(provider),
+        messages: Enum.map(messages, &normalise_message/1),
+        stream: true
+      }
+      |> Map.merge(stream_body_attrs(opts))
 
     req_opts =
       [
@@ -283,6 +286,15 @@ defmodule DefactoAI.Client.LangChain do
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  # The streaming request is built by hand rather than through ChatOpenAI,
+  # so only pass through the per-call chat model attrs that map 1:1 onto
+  # request-body fields.
+  defp stream_body_attrs(opts) do
+    opts
+    |> LangChainAdapter.chat_model_attrs()
+    |> Map.take([:max_tokens, :temperature])
+  end
 
   defp chat_endpoint(provider) do
     base = Provider.base_url(provider) || ""

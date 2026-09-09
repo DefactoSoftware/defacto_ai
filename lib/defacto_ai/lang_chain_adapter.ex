@@ -52,6 +52,37 @@ defmodule DefactoAI.LangChainAdapter do
     ChatOpenAI.new!(Map.merge(base, Map.new(extra_attrs)))
   end
 
+  @doc """
+  Like `build_chat_model/2`, but also merges the caller's per-call chat
+  model attributes from `opts[:chat_model]` (see `chat_model_attrs/1`).
+
+  `extra_attrs` are the strategy's own attributes (`tool_choice`,
+  `json_response`, `stream: false`, ...) and always win over the caller's,
+  so a host cannot accidentally undo what a strategy relies on.
+  """
+  @spec build_chat_model(any(), keyword() | map(), keyword()) :: ChatOpenAI.t()
+  def build_chat_model(provider, extra_attrs, opts) when is_list(opts) do
+    attrs = Map.merge(chat_model_attrs(opts), Map.new(extra_attrs))
+    build_chat_model(provider, attrs)
+  end
+
+  @doc """
+  The caller's per-call `ChatOpenAI` attributes: `opts[:chat_model]` as a
+  keyword list or map (e.g. `chat_model: [max_tokens: 8_000]`), normalised
+  to a map. Missing or `nil` yields `%{}`.
+
+  Some gateways default `max_tokens` too low for long structured answers;
+  a truncated tool-call arguments JSON then fails to parse and cascades
+  through every strategy. Hosts can raise it per call with this option.
+  """
+  @spec chat_model_attrs(keyword()) :: map()
+  def chat_model_attrs(opts) when is_list(opts) do
+    case Keyword.get(opts, :chat_model) do
+      nil -> %{}
+      attrs when is_list(attrs) or is_map(attrs) -> Map.new(attrs)
+    end
+  end
+
   defp stream_default do
     Application.get_env(:defacto_ai, :chat_stream, false)
   end

@@ -128,6 +128,20 @@ The library ships three canonical roles (`:llm`, `:embedding`, `:summary`)
 but the resolver is opaque — hosts can register additional role atoms
 and pass them via `role:` if needed.
 
+## Per-call options
+
+`Client.complete_structured/3`, `Client.complete_chat/2` and
+`Client.stream_chat/2` accept a keyword list of options:
+
+| Option | Applies to | Description |
+|---|---|---|
+| `:provider` | all | Struct implementing `DefactoAI.Provider`. Wins over `:role`. |
+| `:role` | all | Role handed to the configured `provider_resolver` (default `:llm`). |
+| `:max_validation_retries` | `complete_structured` | Corrective retries per strategy before giving up (default `2`). |
+| `:strategies` | `complete_structured` | Strategy order for this call, overriding `:default_strategies`. |
+| `:validation_context` | `complete_structured` | Map/keyword lifted into the schema's `changeset/3` opts. |
+| `:chat_model` | all | Keyword list or map of `LangChain.ChatModels.ChatOpenAI` attributes merged into every request, e.g. `chat_model: [max_tokens: 8_000]`. Use it when a gateway's default `max_tokens` truncates long structured answers (a cut-off tool-call JSON fails to parse and falls through every strategy). Strategy-controlled attributes (`tool_choice`, `json_response`, `stream` for `complete_chat`) always win. `stream_chat/2` only honours `:max_tokens` and `:temperature`. |
+
 ## Schema contract for structured outputs
 
 Modules passed as the first argument to `Client.complete_structured/3`
