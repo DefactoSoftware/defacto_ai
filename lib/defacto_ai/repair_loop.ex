@@ -20,6 +20,13 @@ defmodule DefactoAI.RepairLoop do
   @type decode_fun :: (LLMChain.t() -> {:ok, map() | binary()} | {:error, term()})
   @type result :: {:ok, struct()} | {:error, term()}
 
+  # Stand-in text for an assistant turn whose payload lives entirely in
+  # `tool_calls`. See `fill_blank_content/1`.
+  @tool_call_placeholder "(structured response provided as a tool call)"
+
+  # Upper bound for the retry reason we log and attach to telemetry.
+  @max_reason_length 500
+
   @doc """
   Run a prepared chain, decode and cast its payload, retrying with a
   corrective message on validation failure.
@@ -74,19 +81,28 @@ defmodule DefactoAI.RepairLoop do
 
   defp run_chain(%LLMChain{} = chain, _opts), do: LLMChain.run(chain)
 
-  # A forced tool call comes back as an assistant message with `nil` content
-  # (the payload lives in `tool_calls`). When the repair loop re-sends that
-  # turn on a corrective retry, LangChain serialises it as `"content": null`.
-  # The OpenAI spec permits that alongside `tool_calls`, but some
-  # OpenAI-compatible providers are stricter and reject it with a 400 like
-  # `messages[1]: content is required`. Coerce `nil` content to "" so the
-  # message history round-trips on those providers without losing the tool
-  # calls or our retry budget.
+  # A forced tool call comes back as an assistant message with blank content
+  # (`nil`, `""` or `[]` — the payload lives in `tool_calls`). When the repair
+  # loop re-sends that turn on a corrective retry, LangChain serialises the
+  # content as-is. OpenAI accepts `null`/`""` alongside `tool_calls`, but
+  # gateways fronting Anthropic (e.g. Heroku Inference) require every message
+  # to carry non-empty text and reject the history with a 400 such as
+  # `messages[2]: content is required` — for `null` *and* for `""`. Substitute
+  # a short placeholder so the turn round-trips on those providers without
+  # losing the tool calls or our retry budget. Messages without tool calls
+  # are left untouched: blank content there is a real signal, not an
+  # artefact of tool calling.
   defp ensure_message_content(%LLMChain{messages: messages} = chain) do
     %{chain | messages: Enum.map(messages, &fill_blank_content/1)}
   end
 
-  defp fill_blank_content(%Message{content: nil} = message), do: %{message | content: ""}
+  defp fill_blank_content(
+         %Message{role: :assistant, content: content, tool_calls: [_ | _]} = message
+       )
+       when content in [nil, "", []] do
+    %{message | content: @tool_call_placeholder}
+  end
+
   defp fill_blank_content(%Message{} = message), do: message
 
   defp decode_and_validate(chain, schema_module, decode_fun, budget, opts) do
@@ -97,15 +113,19 @@ defmodule DefactoAI.RepairLoop do
             {:ok, struct}
 
           {:error, validation_error} when budget > 0 ->
-            Logger.debug(fn ->
+            reason = retry_reason(schema_module, decode_fun, validation_error, payload)
+
+            # Info, not debug: in production this is the only place that says
+            # *why* the model's first answer was unusable.
+            Logger.info(fn ->
               "DefactoAI: validation failed, retrying with corrective message " <>
-                "(#{budget - 1} attempts left)"
+                "(#{budget - 1} attempts left): #{reason}"
             end)
 
             :telemetry.execute(
               [:defacto_ai, :repair_loop, :retry],
               %{remaining: budget - 1},
-              %{schema: schema_module}
+              %{schema: schema_module, reason: reason}
             )
 
             chain
@@ -165,6 +185,46 @@ defmodule DefactoAI.RepairLoop do
 
   defp format_payload(payload) when is_binary(payload), do: payload
   defp format_payload(payload), do: inspect(payload)
+
+  # Bounded, log-safe description of a validation failure: which strategy and
+  # schema, what the changeset complained about, and the *shape* of the
+  # payload (top-level keys only — never the full model output).
+  defp retry_reason(schema_module, decode_fun, error, payload) do
+    text =
+      "strategy=#{inspect(strategy_module(decode_fun))} schema=#{inspect(schema_module)} " <>
+        "#{describe_error(error)} payload_keys=#{describe_payload_keys(payload)}"
+
+    truncate(text, @max_reason_length)
+  end
+
+  defp strategy_module(decode_fun) do
+    case Function.info(decode_fun, :module) do
+      {:module, module} -> module
+      _ -> :unknown
+    end
+  end
+
+  defp describe_payload_keys(payload) when is_map(payload) do
+    keys =
+      payload
+      |> Map.keys()
+      |> Enum.map(fn
+        key when is_binary(key) -> key
+        key -> inspect(key)
+      end)
+      |> Enum.sort()
+      |> Enum.join(", ")
+
+    "[" <> keys <> "]"
+  end
+
+  defp describe_payload_keys(payload) when is_binary(payload),
+    do: "<#{byte_size(payload)}-byte text>"
+
+  defp describe_payload_keys(_payload), do: "<non-map>"
+
+  defp truncate(text, max) when byte_size(text) <= max, do: text
+  defp truncate(text, max), do: String.slice(text, 0, max - 1) <> "…"
 
   defp classify_chain_error(%LangChainError{type: type, message: msg} = err) do
     cond do
