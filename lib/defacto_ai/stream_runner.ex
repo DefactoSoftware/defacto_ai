@@ -60,8 +60,8 @@ defmodule DefactoAI.StreamRunner do
 
         {:ok, %{chain | last_message: message, messages: chain.messages ++ [message]}}
 
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, chain, {:api_error, status, body_to_text(body)}}
+      {:ok, %Req.Response{status: status} = resp} ->
+        {:error, chain, {:api_error, status, error_body(resp)}}
 
       {:error, exception} ->
         {:error, chain, {:http_error, http_error_reason(exception)}}
@@ -70,10 +70,30 @@ defmodule DefactoAI.StreamRunner do
 
   # --- SSE collection ---
 
+  # On a 200 the body is an SSE stream and we only care about `data:` lines.
+  # On any other status the gateway sends a plain (usually JSON) error body,
+  # which has no `data:` lines and would otherwise be swallowed by the SSE
+  # parser — so buffer it verbatim and surface it in the `{:api_error, ...}`.
   defp collector do
-    fn {:data, data}, {req, resp} ->
-      state = Req.Response.get_private(resp, :defacto_stream, empty_state())
-      {:cont, {req, Req.Response.put_private(resp, :defacto_stream, consume(state, data))}}
+    fn
+      {:data, data}, {req, %Req.Response{status: 200} = resp} ->
+        state = Req.Response.get_private(resp, :defacto_stream, empty_state())
+        {:cont, {req, Req.Response.put_private(resp, :defacto_stream, consume(state, data))}}
+
+      {:data, data}, {req, resp} ->
+        {:cont, {req, append_error_body(resp, data)}}
+    end
+  end
+
+  defp append_error_body(resp, data) do
+    buffered = Req.Response.get_private(resp, :error_body, "")
+    Req.Response.put_private(resp, :error_body, buffered <> data)
+  end
+
+  defp error_body(%Req.Response{body: body} = resp) do
+    case Req.Response.get_private(resp, :error_body, "") do
+      "" -> body_to_text(body)
+      text -> text
     end
   end
 
