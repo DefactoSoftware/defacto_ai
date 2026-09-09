@@ -1,10 +1,13 @@
 defmodule DefactoAI.StreamRunnerTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias DefactoAI.StreamRunner
   alias LangChain.Chains.LLMChain
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Message
+  alias LangChain.Message.ToolCall
 
   @error_body ~s({"error":{"code":422,"message":"failed to fetch image; check the url provided is valid","type":"unprocessable_entity"}})
 
@@ -26,6 +29,149 @@ defmodule DefactoAI.StreamRunnerTest do
     |> Enum.map(&"data: #{&1}\n\n")
     |> Enum.join()
     |> Kernel.<>("data: [DONE]\n\n")
+  end
+
+  defp stub_sse(json_chunks) do
+    Req.Test.stub(__MODULE__, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.send_resp(200, sse_body(json_chunks))
+    end)
+  end
+
+  defp delta(delta_map), do: Jason.encode!(%{choices: [%{index: 0, delta: delta_map}]})
+
+  defp opening_chunk(index, id, name) do
+    delta(%{
+      tool_calls: [
+        %{index: index, id: id, type: "function", function: %{name: name, arguments: ""}}
+      ]
+    })
+  end
+
+  defp run_tool_calls(json_chunks) do
+    stub_sse(json_chunks)
+
+    assert {:ok, %LLMChain{last_message: %Message{tool_calls: tool_calls}}} =
+             StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+
+    tool_calls
+  end
+
+  describe "run/2 — tool-call deltas" do
+    test "assembles the standard OpenAI shape with an index on every chunk" do
+      tool_calls =
+        run_tool_calls([
+          opening_chunk(0, "call_1", "respond"),
+          delta(%{tool_calls: [%{index: 0, function: %{arguments: ~s({"answer":)}}]}),
+          delta(%{tool_calls: [%{index: 0, function: %{arguments: ~s("42"})}}]})
+        ])
+
+      assert [%ToolCall{call_id: "call_1", name: "respond", arguments: %{"answer" => "42"}}] =
+               tool_calls
+    end
+
+    test "attaches index-less argument deltas to the most recently opened call" do
+      # Anthropic-backed gateways open the call with index/id/name and then
+      # stream argument deltas without any index.
+      tool_calls =
+        run_tool_calls([
+          opening_chunk(0, "call_1", "respond"),
+          delta(%{tool_calls: [%{function: %{arguments: ~s({"answer":)}}]}),
+          delta(%{tool_calls: [%{function: %{arguments: ~s("42"})}}]})
+        ])
+
+      assert [%ToolCall{call_id: "call_1", name: "respond", arguments: %{"answer" => "42"}}] =
+               tool_calls
+    end
+
+    test "attaches argument deltas whose index never opened a call to the current call" do
+      tool_calls =
+        run_tool_calls([
+          opening_chunk(0, "call_1", "respond"),
+          delta(%{tool_calls: [%{index: 1, function: %{arguments: ~s({"answer":)}}]}),
+          delta(%{tool_calls: [%{index: 1, function: %{arguments: ~s("42"})}}]})
+        ])
+
+      assert [%ToolCall{call_id: "call_1", name: "respond", arguments: %{"answer" => "42"}}] =
+               tool_calls
+    end
+
+    test "keeps properly indexed parallel tool calls apart" do
+      tool_calls =
+        run_tool_calls([
+          opening_chunk(0, "call_a", "first"),
+          opening_chunk(1, "call_b", "second"),
+          delta(%{tool_calls: [%{index: 0, function: %{arguments: ~s({"n":1})}}]}),
+          delta(%{tool_calls: [%{index: 1, function: %{arguments: ~s({"n":2})}}]})
+        ])
+
+      assert [
+               %ToolCall{index: 0, call_id: "call_a", name: "first", arguments: %{"n" => 1}},
+               %ToolCall{index: 1, call_id: "call_b", name: "second", arguments: %{"n" => 2}}
+             ] = tool_calls
+    end
+
+    test "accepts a complete (non-delta) message with finished tool calls" do
+      complete =
+        Jason.encode!(%{
+          choices: [
+            %{
+              index: 0,
+              message: %{
+                role: "assistant",
+                content: nil,
+                tool_calls: [
+                  %{
+                    id: "call_9",
+                    type: "function",
+                    function: %{name: "respond", arguments: ~s({"answer":"x"})}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+
+      assert [%ToolCall{call_id: "call_9", name: "respond", arguments: %{"answer" => "x"}}] =
+               run_tool_calls([complete])
+    end
+
+    test "accepts the legacy function_call shape as tool call 0" do
+      tool_calls =
+        run_tool_calls([
+          delta(%{function_call: %{name: "respond", arguments: ""}}),
+          delta(%{function_call: %{arguments: ~s({"answer":"y"})}})
+        ])
+
+      assert [%ToolCall{index: 0, name: "respond", arguments: %{"answer" => "y"}}] = tool_calls
+    end
+
+    test "logs a bounded sample of raw chunks when a tool call ends with empty arguments" do
+      stub_sse([opening_chunk(0, "call_1", "respond")])
+
+      log =
+        capture_log([level: :info], fn ->
+          assert {:ok, %LLMChain{last_message: %Message{tool_calls: [%ToolCall{}]}}} =
+                   StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+        end)
+
+      assert log =~ "DefactoAI.StreamRunner: streamed tool call finished with empty arguments"
+      assert log =~ "1 raw tool-call chunk(s) seen"
+      assert log =~ ~s("id" => "call_1")
+    end
+
+    test "stays quiet when the tool call carries arguments" do
+      log =
+        capture_log([level: :info], fn ->
+          run_tool_calls([
+            opening_chunk(0, "call_1", "respond"),
+            delta(%{tool_calls: [%{index: 0, function: %{arguments: ~s({"answer":"42"})}}]})
+          ])
+        end)
+
+      refute log =~ "empty arguments"
+    end
   end
 
   describe "run/2" do
