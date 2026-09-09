@@ -139,6 +139,63 @@ defmodule DefactoAI.StrategyTest do
       chain = %LLMChain{llm: %ChatOpenAI{}, last_message: nil}
       assert {:error, :no_message} = Strategy.ToolCall.decode_payload(chain)
     end
+
+    test "hands unparsed argument text to the JSON pipeline" do
+      truncated = ~s({"answer": "4)
+
+      chain = %LLMChain{
+        llm: %ChatOpenAI{},
+        last_message: %Message{
+          role: :assistant,
+          tool_calls: [%ToolCall{name: "respond", arguments: truncated, status: :complete}]
+        }
+      }
+
+      assert {:ok, ^truncated} = Strategy.ToolCall.decode_payload(chain)
+    end
+
+    test "falls back to the message content when the respond call has no arguments" do
+      content = "```json\n{\"answer\": \"42\"}\n```"
+
+      chain = %LLMChain{
+        llm: %ChatOpenAI{},
+        last_message: %Message{
+          role: :assistant,
+          content: content,
+          tool_calls: [%ToolCall{name: "respond", arguments: %{}, status: :complete}]
+        }
+      }
+
+      assert {:ok, ^content} = Strategy.ToolCall.decode_payload(chain)
+    end
+
+    test "falls back to text content parts when the respond call has no arguments" do
+      chain = %LLMChain{
+        llm: %ChatOpenAI{},
+        last_message: %Message{
+          role: :assistant,
+          content: [LangChain.Message.ContentPart.text!(~s({"answer": "42"}))],
+          tool_calls: [%ToolCall{name: "respond", arguments: nil, status: :complete}]
+        }
+      }
+
+      assert {:ok, ~s({"answer": "42"})} = Strategy.ToolCall.decode_payload(chain)
+    end
+
+    test "errors :empty_tool_call when neither arguments nor content carry anything" do
+      for {arguments, content} <- [{%{}, nil}, {nil, ""}, {"", "  "}, {%{}, []}] do
+        chain = %LLMChain{
+          llm: %ChatOpenAI{},
+          last_message: %Message{
+            role: :assistant,
+            content: content,
+            tool_calls: [%ToolCall{name: "respond", arguments: arguments, status: :complete}]
+          }
+        }
+
+        assert {:error, :empty_tool_call} = Strategy.ToolCall.decode_payload(chain)
+      end
+    end
   end
 
   describe "ToolCall.decode_payload/1 with several tool calls" do

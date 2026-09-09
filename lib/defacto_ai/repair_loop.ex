@@ -109,6 +109,12 @@ defmodule DefactoAI.RepairLoop do
 
   defp decode_and_validate(chain, schema_module, decode_fun, budget, opts) do
     case decode_fun.(chain) do
+      # An empty payload is not something a corrective retry can repair —
+      # the model produced nothing usable for this strategy. Report a decode
+      # failure so the client falls back to the next strategy.
+      {:ok, payload} when payload == %{} ->
+        {:error, {:decode_failed, :empty_payload}}
+
       {:ok, payload} ->
         case JSON.decode_and_cast(payload, schema_module, opts) do
           {:ok, struct} ->

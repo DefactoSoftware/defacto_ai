@@ -56,7 +56,7 @@ defmodule DefactoAI.Strategy.ToolCall do
   def decode_payload(%LangChain.Chains.LLMChain{last_message: message}) do
     case message.tool_calls || [] do
       [] -> {:error, :no_tool_call}
-      calls -> calls |> pick_tool_call() |> extract_arguments()
+      calls -> calls |> pick_tool_call() |> extract_arguments(message)
     end
   end
 
@@ -73,14 +73,46 @@ defmodule DefactoAI.Strategy.ToolCall do
   defp respond?(%LangChain.Message.ToolCall{name: @tool_name}), do: true
   defp respond?(_), do: false
 
-  defp extract_arguments(%LangChain.Message.ToolCall{name: @tool_name, arguments: args})
-       when is_map(args),
-       do: {:ok, args}
+  defp extract_arguments(%LangChain.Message.ToolCall{name: @tool_name, arguments: args}, message) do
+    content = content_text(message)
 
-  defp extract_arguments(%LangChain.Message.ToolCall{name: @tool_name, arguments: nil}),
-    do: {:ok, %{}}
+    cond do
+      is_map(args) and map_size(args) > 0 ->
+        {:ok, args}
 
-  defp extract_arguments(%LangChain.Message.ToolCall{}), do: {:error, :wrong_tool_call}
+      # Argument text that did not parse (e.g. truncated by max_tokens): hand
+      # it to JSON.decode_and_cast, which strips fences and repairs.
+      is_binary(args) and String.trim(args) != "" ->
+        {:ok, args}
+
+      # Some streaming gateways deliver the answer as plain content next to a
+      # tool call whose arguments never arrive. The JSON pipeline can dig the
+      # payload out of that text.
+      content != "" ->
+        {:ok, content}
+
+      # Nothing usable anywhere. A corrective retry cannot fix an empty
+      # payload, so signal a decode failure and let the client fall back to
+      # the next strategy instead of spending the repair budget.
+      true ->
+        {:error, :empty_tool_call}
+    end
+  end
+
+  defp extract_arguments(%LangChain.Message.ToolCall{}, _message), do: {:error, :wrong_tool_call}
+
+  defp content_text(%{content: content}) when is_binary(content), do: String.trim(content)
+
+  defp content_text(%{content: parts}) when is_list(parts) do
+    parts
+    |> Enum.map_join("", fn
+      %LangChain.Message.ContentPart{type: :text, content: text} when is_binary(text) -> text
+      _ -> ""
+    end)
+    |> String.trim()
+  end
+
+  defp content_text(_message), do: ""
 
   defp fetch_parameters_schema(schema_module) do
     Code.ensure_loaded(schema_module)

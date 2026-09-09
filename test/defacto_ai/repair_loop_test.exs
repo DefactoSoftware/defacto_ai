@@ -233,6 +233,20 @@ defmodule DefactoAI.RepairLoopTest do
     end
   end
 
+  describe "run/5 — empty payloads" do
+    test "treats an empty decoded payload as a decode failure, not a validation failure" do
+      stub_upstream([~s({"answer":"42"})])
+      decode_empty = fn _chain -> {:ok, %{}} end
+
+      assert {:error, {:decode_failed, :empty_payload}} =
+               RepairLoop.run(chain(), TestSchema, decode_empty, 2, plug: {Req.Test, __MODULE__})
+
+      # Exactly one upstream call: no repair budget was spent.
+      assert_received {:request, _}
+      refute_received {:request, _}
+    end
+  end
+
   describe "run/5 — validation failure visibility" do
     test "logs the failure at :info with strategy, schema, errors and payload keys" do
       # First answer has the wrong key (so `answer` is blank), second is valid.
