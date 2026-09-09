@@ -227,8 +227,13 @@ defmodule DefactoAI.StreamRunnerTest do
       assert [%ToolCall{index: 0, name: "respond", arguments: %{"answer" => "y"}}] = tool_calls
     end
 
-    test "logs a bounded sample of raw chunks when a tool call ends with empty arguments" do
-      stub_sse([opening_chunk(0, "call_1", "respond")])
+    test "logs a bounded picture of the stream when a tool call ends with empty arguments" do
+      stub_sse([
+        # Not a delta/message chunk: counted and sampled as unrecognised.
+        ~s({"type":"ping"}),
+        delta(%{content: "Here is the answer"}),
+        opening_chunk(0, "call_1", "respond")
+      ])
 
       log =
         capture_log([level: :info], fn ->
@@ -237,8 +242,12 @@ defmodule DefactoAI.StreamRunnerTest do
         end)
 
       assert log =~ "DefactoAI.StreamRunner: streamed tool call finished with empty arguments"
+      assert log =~ "content_length=18"
+      assert log =~ "frames=3 unrecognised=1"
       assert log =~ "1 raw tool-call chunk(s) seen"
       assert log =~ ~s("id" => "call_1")
+      assert log =~ ~s(content_sample: "Here is the answer")
+      assert log =~ ~S(unrecognised_sample: "{\"type\":\"ping\"}")
     end
 
     test "stays quiet when the tool call carries arguments" do
