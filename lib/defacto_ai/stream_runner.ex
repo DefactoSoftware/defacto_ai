@@ -118,6 +118,11 @@ defmodule DefactoAI.StreamRunner do
       last_started: nil,
       raw_tool_deltas: [],
       raw_tool_delta_count: 0,
+      # Diagnostics: how many `data:` JSON frames we parsed, how many of them
+      # we did not recognise as delta/message chunks, and one such frame.
+      frames: 0,
+      unrecognised: 0,
+      unrecognised_sample: nil,
       usage: nil
     }
   end
@@ -143,33 +148,55 @@ defmodule DefactoAI.StreamRunner do
     case String.trim_leading(rest, " ") do
       "" -> state
       "[DONE]" -> state
-      json -> apply_json(state, Jason.decode(json))
+      json -> apply_json(%{state | frames: state.frames + 1}, Jason.decode(json), json)
     end
   end
 
   defp apply_line(_, state), do: state
 
-  # Usage can ride on any chunk, so it is read from every JSON frame.
+  # Usage can ride on any chunk (OpenAI sends it on a final chunk with empty
+  # `choices`), so it is read from every JSON frame before the choice is
+  # looked at.
   #
   # Standard OpenAI streaming puts partial content in `choices[0].delta`.
   # Some gateways also emit a complete `choices[0].message` (the non-delta
-  # form) inside the stream; treat its tool calls as finished.
-  defp apply_json(state, {:ok, %{} = data}) do
+  # form) inside the stream; treat its tool calls as finished. Anything else
+  # is counted (and sampled once) for the empty-arguments diagnostics.
+  defp apply_json(state, {:ok, %{} = data}, raw) do
     state
     |> merge_usage(data["usage"])
-    |> apply_choices(data)
+    |> apply_choices(data, raw)
   end
 
-  defp apply_json(state, _), do: state
+  defp apply_json(state, _decoded, raw), do: note_unrecognised(state, raw)
 
-  defp apply_choices(state, %{"choices" => [%{"delta" => delta} | _]}) when is_map(delta),
-    do: merge_choice(state, delta, :delta)
+  defp apply_choices(state, %{"choices" => [%{"delta" => delta} | _]}, _raw)
+       when is_map(delta),
+       do: merge_choice(state, delta, :delta)
 
-  defp apply_choices(state, %{"choices" => [%{"message" => message} | _]})
+  defp apply_choices(state, %{"choices" => [%{"message" => message} | _]}, _raw)
        when is_map(message),
        do: merge_choice(state, message, :complete)
 
-  defp apply_choices(state, _), do: state
+  # A usage-only frame (empty `choices`) is recognised, just not a choice.
+  defp apply_choices(state, %{"choices" => [], "usage" => %{}}, _raw), do: state
+
+  defp apply_choices(state, _data, raw), do: note_unrecognised(state, raw)
+
+  defp note_unrecognised(state, raw) do
+    %{
+      state
+      | unrecognised: state.unrecognised + 1,
+        unrecognised_sample: state.unrecognised_sample || truncate(raw, @raw_delta_max_chars)
+    }
+  end
+
+  defp merge_choice(state, choice, mode) do
+    state
+    |> merge_content(choice["content"])
+    |> merge_tool_calls(choice["tool_calls"], mode)
+    |> merge_function_call(choice["function_call"], mode)
+  end
 
   # With `stream_options: %{include_usage: true}` OpenAI sends one extra
   # chunk with empty `choices` and a `usage` object. Some gateways repeat a
@@ -186,13 +213,6 @@ defmodule DefactoAI.StreamRunner do
   end
 
   defp merge_usage(state, _), do: state
-
-  defp merge_choice(state, choice, mode) do
-    state
-    |> merge_content(choice["content"])
-    |> merge_tool_calls(choice["tool_calls"], mode)
-    |> merge_function_call(choice["function_call"], mode)
-  end
 
   defp merge_content(state, content) when is_binary(content),
     do: %{state | content: state.content <> content}
@@ -369,11 +389,12 @@ defmodule DefactoAI.StreamRunner do
     }
   end
 
-  # A tool call that finished with no arguments while the reply also has no
-  # content means we did not recognise the gateway's argument-delta shape.
-  # Log a bounded sample of the raw chunks so the real shape shows up in
-  # production logs instead of just "validation failed".
-  defp maybe_log_empty_arguments(%{content: "", tool_calls: tool_calls} = state)
+  # A tool call that finished with no arguments means we did not receive (or
+  # did not recognise) the gateway's argument deltas. Log a bounded picture of
+  # what *did* arrive — raw tool-call chunks, assembled content, frame counts
+  # and one unrecognised frame — so the real shape shows up in production
+  # logs instead of just "validation failed".
+  defp maybe_log_empty_arguments(%{tool_calls: tool_calls} = state)
        when map_size(tool_calls) > 0 do
     if Enum.any?(tool_calls, fn {_index, call} -> call.arguments == "" end) do
       sample =
@@ -383,7 +404,11 @@ defmodule DefactoAI.StreamRunner do
 
       Logger.info(fn ->
         "DefactoAI.StreamRunner: streamed tool call finished with empty arguments; " <>
-          "#{state.raw_tool_delta_count} raw tool-call chunk(s) seen, sample: #{sample}"
+          "content_length=#{String.length(state.content)} " <>
+          "frames=#{state.frames} unrecognised=#{state.unrecognised} " <>
+          "#{state.raw_tool_delta_count} raw tool-call chunk(s) seen, sample: #{sample}; " <>
+          "content_sample: #{inspect(truncate(state.content, @raw_delta_max_chars))}; " <>
+          "unrecognised_sample: #{inspect(state.unrecognised_sample)}"
       end)
     end
 

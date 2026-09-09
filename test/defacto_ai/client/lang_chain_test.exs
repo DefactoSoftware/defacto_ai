@@ -61,6 +61,7 @@ defmodule DefactoAI.Client.LangChainTest do
       case answer do
         a when is_binary(a) -> %{answer: a}
         :empty -> %{}
+        :wrong_key -> %{wrong: "x"}
       end
 
     Jason.encode!(%{
@@ -209,10 +210,23 @@ defmodule DefactoAI.Client.LangChainTest do
                LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
     end
 
+    test "falls back to JSON mode instead of retrying when the tool call is empty",
+         %{bypass: bypass, base_url: url} do
+      # An empty tool call is unfixable by a corrective retry: the ToolCall
+      # strategy reports a decode failure and the next strategy takes over.
+      expect_in_order(bypass, [
+        ok(openai_tool_call_response(:empty)),
+        ok(openai_text_response(~s({"answer": "fallback"})))
+      ])
+
+      assert {:ok, %TestSchema{answer: "fallback"}} =
+               LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
     test "appends a corrective message and retries on validation failure",
          %{bypass: bypass, base_url: url} do
       expect_in_order(bypass, [
-        ok(openai_tool_call_response(:empty)),
+        ok(openai_tool_call_response(:wrong_key)),
         ok(openai_tool_call_response("second-try"))
       ])
 
@@ -239,7 +253,7 @@ defmodule DefactoAI.Client.LangChainTest do
         {status, resp_body, content_type} =
           cond do
             has_null_content? -> api_error(400, "messages[1]: content is required")
-            idx == 0 -> ok(openai_tool_call_response(:empty))
+            idx == 0 -> ok(openai_tool_call_response(:wrong_key))
             true -> ok(openai_tool_call_response("after-repair"))
           end
 
@@ -256,9 +270,9 @@ defmodule DefactoAI.Client.LangChainTest do
          %{bypass: bypass, base_url: url} do
       # budget = 2 means: initial call + 2 retries = 3 upstream calls
       expect_in_order(bypass, [
-        ok(openai_tool_call_response(:empty)),
-        ok(openai_tool_call_response(:empty)),
-        ok(openai_tool_call_response(:empty))
+        ok(openai_tool_call_response(:wrong_key)),
+        ok(openai_tool_call_response(:wrong_key)),
+        ok(openai_tool_call_response(:wrong_key))
       ])
 
       assert {:error, {:validation_failed, %Ecto.Changeset{valid?: false}}} =
@@ -456,6 +470,42 @@ defmodule DefactoAI.Client.LangChainTest do
                LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
     end
 
+    test "falls back to JSON mode when the streamed tool call carries no arguments" do
+      test_pid = self()
+      counter = :atomics.new(1, [])
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        idx = :atomics.add_get(counter, 1, 1) - 1
+        send(test_pid, {:request, idx, Jason.decode!(raw)})
+
+        chunks =
+          case idx do
+            # ToolCall strategy: the call opens but no argument delta ever arrives.
+            0 -> [tool_call_open("respond", "call_1")]
+            # JsonMode strategy: plain JSON content.
+            _ -> [chunk_json(~s({"answer":)), chunk_json(~s("fallback"}))]
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse_payload(chunks))
+      end)
+
+      assert {:ok, %TestSchema{answer: "fallback"}} =
+               LangChain.complete_structured(TestSchema, messages(),
+                 provider: TestProvider.new(),
+                 plug: {Req.Test, __MODULE__}
+               )
+
+      assert_received {:request, 0, %{"tool_choice" => %{"type" => "function"}}}
+      assert_received {:request, 1, second}
+      assert second["response_format"]["type"] == "json_object"
+      refute Map.has_key?(second, "tool_choice")
+      # No repair-loop retry was spent on the empty tool call.
+      refute_received {:request, 2, _}
+    end
+
     test "merges per-call chat_model attrs into the request, strategy attrs winning" do
       test_pid = self()
 
@@ -533,12 +583,15 @@ defmodule DefactoAI.Client.LangChainTest do
     })
   end
 
+  defp sse_payload(json_chunks) do
+    json_chunks
+    |> Enum.map(&"data: #{&1}\n\n")
+    |> Enum.join()
+    |> Kernel.<>("data: [DONE]\n\n")
+  end
+
   defp sse_route(bypass, json_chunks) do
-    body =
-      json_chunks
-      |> Enum.map(&"data: #{&1}\n\n")
-      |> Enum.join()
-      |> Kernel.<>("data: [DONE]\n\n")
+    body = sse_payload(json_chunks)
 
     Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
       conn
