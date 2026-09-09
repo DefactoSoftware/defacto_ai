@@ -269,6 +269,56 @@ defmodule DefactoAI.Client.LangChainTest do
     end
   end
 
+  describe "chat_model option" do
+    test "merges max_tokens into a non-streamed complete_chat request",
+         %{bypass: bypass, base_url: url} do
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, Jason.decode!(raw)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, openai_text_response("Hello there!"))
+      end)
+
+      assert {:ok, "Hello there!"} =
+               LangChain.complete_chat([%{role: "user", content: "hi"}],
+                 provider: provider(url),
+                 chat_model: [max_tokens: 256, stream: true]
+               )
+
+      assert_received {:request, body}
+      assert body["max_tokens"] == 256
+      # The client controls streaming for complete_chat; the caller cannot flip it.
+      assert body["stream"] == false
+    end
+
+    test "merges max_tokens into a stream_chat request" do
+      test_pid = self()
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, Jason.decode!(raw)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, "data: #{chunk_json("hi")}\n\ndata: [DONE]\n\n")
+      end)
+
+      assert {:ok, stream} =
+               LangChain.stream_chat([%{role: "user", content: "x"}],
+                 provider: TestProvider.new(),
+                 chat_model: %{max_tokens: 512},
+                 plug: {Req.Test, __MODULE__}
+               )
+
+      assert Enum.to_list(stream) == ["hi"]
+      assert_received {:request, %{"max_tokens" => 512, "stream" => true}}
+    end
+  end
+
   describe "complete_chat/2" do
     test "returns the assembled assistant content as a binary",
          %{bypass: bypass, base_url: url} do
@@ -404,6 +454,35 @@ defmodule DefactoAI.Client.LangChainTest do
 
       assert {:ok, %TestSchema{answer: "x"}} =
                LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
+    test "merges per-call chat_model attrs into the request, strategy attrs winning" do
+      test_pid = self()
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, Jason.decode!(raw)})
+
+        body =
+          [tool_call_open("respond", "call_1"), tool_call_args(~s({"answer":"42"}))]
+          |> Enum.map_join("", &"data: #{&1}\n\n")
+          |> Kernel.<>("data: [DONE]\n\n")
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+
+      assert {:ok, %TestSchema{answer: "42"}} =
+               LangChain.complete_structured(TestSchema, messages(),
+                 provider: TestProvider.new(),
+                 chat_model: [max_tokens: 4096, tool_choice: "none"],
+                 plug: {Req.Test, __MODULE__}
+               )
+
+      assert_received {:request, body}
+      assert body["max_tokens"] == 4096
+      assert %{"type" => "function", "function" => %{"name" => "respond"}} = body["tool_choice"]
     end
 
     test "assembles streamed content for the JSON-mode strategy",

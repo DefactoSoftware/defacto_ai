@@ -51,6 +51,21 @@ defmodule DefactoAI.Client do
   @typedoc "Anything implementing `DefactoAI.Provider`."
   @type provider :: any()
 
+  @typedoc """
+  Per-call options.
+
+    * `:provider` — a struct implementing `DefactoAI.Provider`; wins over `:role`.
+    * `:role` — role passed to the configured `provider_resolver`.
+    * `:max_validation_retries` — corrective retries per strategy (default 2).
+    * `:strategies` — structured-output strategy order for this call.
+    * `:validation_context` — extra data lifted into the schema's `changeset/3` opts.
+    * `:chat_model` — keyword list or map of `LangChain.ChatModels.ChatOpenAI`
+      attributes merged into every request of the call, e.g.
+      `chat_model: [max_tokens: 8_000]`. Strategy-controlled attributes
+      (`tool_choice`, `json_response`, `stream` for `complete_chat/2`) win.
+      `stream_chat/2` builds its request by hand and only honours
+      `:max_tokens` and `:temperature` from it.
+  """
   @type opts :: [
           {:provider, provider()}
           | {:telemetry_tags, map()}
@@ -58,6 +73,7 @@ defmodule DefactoAI.Client do
           | {:max_validation_retries, non_neg_integer()}
           | {:strategies, [module()]}
           | {:validation_context, map()}
+          | {:chat_model, keyword() | map()}
           | {atom(), term()}
         ]
 
