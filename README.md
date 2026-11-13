@@ -71,6 +71,7 @@ All keys:
 | `:provider_resolver` | — (required unless every call passes `provider:`) | 1-arity function `(role -> struct)`. Returns a struct that implements `DefactoAI.Provider`, or `nil` if no provider is configured for that role. |
 | `:client` | `DefactoAI.Client.LangChain` | Implementation of the `Client` behaviour. Tests set this to `DefactoAI.Client.Stub`. |
 | `:chat_stream` | `false` | Whether `LangChainAdapter` builds streaming chat models by default. Flip to `true` if your gateway times out long non-streamed completions. |
+| `:stream_include_usage` | `false` | Send `stream_options: %{include_usage: true}` on streamed requests so the provider reports token usage. Off by default because providers that do not know the option may reject the request. See [Telemetry](#telemetry). |
 | `:default_strategies` | `[ToolCall, JsonMode, TextRepair]` | Order of structured-output strategies to try. |
 | `:error_reporter` | `nil` | 2-arity function `(title, extras_map -> :ok)`. Called when the embeddings client encounters HTTP/API errors. Useful for Sentry integration; safe to leave unset. |
 | `:embedding_rate_limit` | `450` | Embeddings per minute. |
@@ -249,20 +250,159 @@ hits =
 # => [%{embeddable_type: "article", embeddable_id: "...", score: 0.91, chunks: [...]}, ...]
 ```
 
-## Telemetry events
+## Telemetry
 
-```
-[:defacto_ai, :complete_structured, :start | :stop | :exception]
-[:defacto_ai, :complete_chat,        :start | :stop | :exception]
-[:defacto_ai, :embed,                 :start | :stop | :exception]
-[:defacto_ai, :embed_batch,           :start | :stop | :exception]
-[:defacto_ai, :similarity_search,     :start | :stop | :exception]
-[:defacto_ai, :strategy, :rejected]   # emitted when a strategy is skipped
-[:defacto_ai, :repair_loop, :retry]   # emitted on every corrective retry
+Every call to the LLM or the embeddings endpoint emits
+[`:telemetry`](https://hexdocs.pm/telemetry) events, so a host can record
+what each call cost and which part of the app made it. The library only
+emits events. Where they go (a database table, metrics, logs) is up to the
+handler you attach.
+
+### Events
+
+Calls that are wrapped in `:telemetry.span/3` emit `:start`, `:stop` and
+`:exception` events. `stream_chat` emits the same three events, but by hand
+(see below). Durations are in native time units.
+
+| Event | Emitted by |
+|---|---|
+| `[:defacto_ai, :complete_structured, :start \| :stop \| :exception]` | `DefactoAI.Client.complete_structured/3` |
+| `[:defacto_ai, :complete_chat, :start \| :stop \| :exception]` | `DefactoAI.Client.complete_chat/2` |
+| `[:defacto_ai, :stream_chat, :start \| :stop \| :exception]` | `DefactoAI.Client.stream_chat/2` |
+| `[:defacto_ai, :embed, :start \| :stop \| :exception]` | `DefactoAI.Embeddings.embed/2` |
+| `[:defacto_ai, :embed_batch, :start \| :stop \| :exception]` | `DefactoAI.Embeddings.embed_batch/2` |
+| `[:defacto_ai, :similarity_search, :start \| :stop \| :exception]` | `DefactoAI.SimilaritySearch.search/2` |
+| `[:defacto_ai, :strategy, :rejected]` | a structured-output strategy was skipped |
+| `[:defacto_ai, :repair_loop, :retry]` | a corrective retry was started |
+
+### Measurements
+
+| Event | Measurements |
+|---|---|
+| `:start` | `monotonic_time`, `system_time` |
+| `:stop` | `duration`, `monotonic_time` |
+| `:exception` | `duration`, `monotonic_time` |
+| `[:defacto_ai, :strategy, :rejected]` | `count` (always `1`) |
+| `[:defacto_ai, :repair_loop, :retry]` | `remaining` (retries left after this one) |
+
+### Metadata
+
+The `:stop` events of `complete_structured`, `complete_chat`, `stream_chat`,
+`embed` and `embed_batch` all carry:
+
+| Key | Value |
+|---|---|
+| `provider` | The resolved provider's `provider_type` as a string, or `nil` when the provider has none or could not be resolved. |
+| `model` | The resolved provider's model as a string, or `nil` when no provider was resolved. |
+| `role` | The `role:` the call was made with (`:llm` by default for chat, `:embedding` for embeddings). `nil` when only `provider:` was given. |
+| `usage` | `%{input_tokens: integer \| nil, output_tokens: integer \| nil}`. Summed over every request the call made, including validation retries and strategy fallbacks. A value is `nil` when the provider did not report it. |
+| `result` | `:ok` for an `{:ok, _}` result, `:error` for anything else. |
+| `tags` | The map passed as `telemetry_tags:`, `%{}` by default. |
+
+Some events add keys of their own:
+
+  - `complete_structured` also has `schema` (the response schema module).
+  - `embed_batch` also has `count` (number of texts).
+  - `:start` events carry `role` and `tags`, plus `schema` or `count` where
+    the `:stop` event has them. They do not carry `provider`, `model`,
+    `usage` or `result`, because those are not known yet.
+  - `:exception` events carry `kind`, `reason` and `stacktrace`. For the
+    span-based events that is the start metadata plus those keys. For
+    `stream_chat`, an exception while the stream is consumed carries the
+    `:stop` metadata plus those keys. If `stream_chat/2` itself raises, the
+    metadata is `role`, `tags`, `kind`, `reason` and `stacktrace`.
+
+Three events do not carry the keys above. `similarity_search` has an empty
+`:start` metadata and `count` (hits returned) on `:stop`.
+`[:defacto_ai, :strategy, :rejected]` carries `strategy` and `reason`.
+`[:defacto_ai, :repair_loop, :retry]` carries `schema`.
+
+### Tagging calls
+
+Pass `telemetry_tags:` to say which feature made a call:
+
+```elixir
+DefactoAI.Client.complete_chat(messages, telemetry_tags: %{feature: :my_feature})
 ```
 
-`stream_chat/2` is intentionally not wrapped in a span — the span would
-close before the stream is consumed.
+All of `complete_structured/3`, `complete_chat/2`, `stream_chat/2`,
+`Embeddings.embed/2` and `Embeddings.embed_batch/2` accept it. The option is
+only used for telemetry. It is never sent to the provider and is not passed
+on to the schema changeset.
+
+### Where usage comes from
+
+  - **`complete_chat`.** LangChain's token usage on the assistant message,
+    summed over every request that returned one.
+  - **`complete_structured`.** The same, including validation retries and
+    strategy fallbacks.
+  - **`embed`.** The response's `prompt_tokens`, reported as `input_tokens`.
+    **`embed_batch`.** The same, summed over the texts. Embedding endpoints
+    report no output tokens, so `output_tokens` is always `nil` there.
+  - **`stream_chat`.** The `usage` object in the SSE chunks, when the provider
+    sends one. Otherwise `input_tokens` and `output_tokens` stay `nil`.
+
+Streaming providers send usage when asked for it with
+`stream_options: %{include_usage: true}`. Providers that do not know that
+option may reject the whole request, so the library does not send it unless
+you turn it on:
+
+```elixir
+config :defacto_ai, stream_include_usage: true
+```
+
+This applies to `stream_chat/2` and, when `:chat_stream` is `true`,
+to streamed structured calls. The setting is global: turn it on only when
+every provider you stream from accepts the option. Usage is read from the
+stream whenever a provider sends it, even with the setting off.
+
+### `stream_chat` events
+
+A stream is lazy, so there is no span around it. `:start` is emitted at the start of
+`stream_chat/2`, before it returns. `:stop` is emitted when the stream
+ends, when the consumer halts it early (for example with `Enum.take/2`) or
+when the stream yields `{:error, reason}` and stops. `result` is `:error` if
+the stream yielded an error element, and `duration` runs from the `:start`
+event to the end of the stream. If enumerating the stream raises, an
+`:exception` event is emitted instead of `:stop`. A stream that is never
+enumerated never emits `:stop`.
+
+If `stream_chat/2` itself returns `{:error, reason}`, `:stop` is emitted
+before it returns, with `result: :error`. If it raises, `:exception` is
+emitted instead of `:stop`.
+
+### Example: record every call to the LLM or the embeddings endpoint
+
+```elixir
+defmodule MyApp.AI.UsageRecorder do
+  def attach do
+    events =
+      for name <- [:complete_structured, :complete_chat, :stream_chat, :embed, :embed_batch] do
+        [:defacto_ai, name, :stop]
+      end
+
+    :telemetry.attach_many("my-app-ai-usage", events, &__MODULE__.handle_event/4, nil)
+  end
+
+  def handle_event(event, %{duration: duration}, metadata, _config) do
+    MyApp.Repo.insert!(%MyApp.AI.CallLog{
+      call: event |> Enum.at(1) |> Atom.to_string(),
+      provider: metadata.provider,
+      model: metadata.model,
+      feature: metadata.tags[:feature] && to_string(metadata.tags[:feature]),
+      input_tokens: metadata.usage.input_tokens,
+      output_tokens: metadata.usage.output_tokens,
+      result: Atom.to_string(metadata.result),
+      duration_ms: System.convert_time_unit(duration, :native, :millisecond)
+    })
+  end
+end
+```
+
+Call `MyApp.AI.UsageRecorder.attach/0` once when your application starts.
+Handlers run in the process that emits the event. That is the caller,
+except for a stream's `:stop` and a mid-stream `:exception`, which run in the
+process that consumes the stream. Keep handlers fast, or hand the row to a job queue.
 
 ## Testing
 
