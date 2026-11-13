@@ -49,8 +49,22 @@ defmodule DefactoAI.LangChainAdapter do
       stream: stream_default()
     }
 
-    ChatOpenAI.new!(Map.merge(base, Map.new(extra_attrs)))
+    attrs = Map.merge(base, Map.new(extra_attrs))
+    ChatOpenAI.new!(maybe_stream_options(attrs))
   end
+
+  # Asks the provider to report token usage in the stream. Off by default
+  # because providers that do not know `stream_options` may reject the
+  # request; see `:stream_include_usage` in the README.
+  defp maybe_stream_options(%{stream: true} = attrs) do
+    if Application.get_env(:defacto_ai, :stream_include_usage, false) do
+      Map.put_new(attrs, :stream_options, %{include_usage: true})
+    else
+      attrs
+    end
+  end
+
+  defp maybe_stream_options(attrs), do: attrs
 
   defp stream_default do
     Application.get_env(:defacto_ai, :chat_stream, false)

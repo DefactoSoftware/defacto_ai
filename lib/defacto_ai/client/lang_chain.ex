@@ -186,9 +186,11 @@ defmodule DefactoAI.Client.LangChain do
     caller = self()
     ref = make_ref()
     timeout = Keyword.get(opts, :stream_timeout, @default_stream_timeout)
+    telemetry = Telemetry.current()
 
     task =
       Task.async(fn ->
+        Telemetry.attach(telemetry)
         run_stream_request(provider, messages, opts, caller, ref, timeout)
       end)
 
@@ -231,6 +233,11 @@ defmodule DefactoAI.Client.LangChain do
       stream: true
     }
 
+    body =
+      if Application.get_env(:defacto_ai, :stream_include_usage, false),
+        do: Map.put(body, :stream_options, %{include_usage: true}),
+        else: body
+
     req_opts =
       [
         url: url,
@@ -246,6 +253,9 @@ defmodule DefactoAI.Client.LangChain do
 
     case Req.post(req_opts) do
       {:ok, %Req.Response{status: 200}} ->
+        # Usage is recorded before :done so it is complete by the time the
+        # consumer sees the end of the stream.
+        flush_stream_usage()
         send(caller, {ref, :done})
 
       {:ok, %Req.Response{status: status, body: body}} ->
@@ -332,12 +342,35 @@ defmodule DefactoAI.Client.LangChain do
 
   defp parse_json_chunk(json) do
     case Jason.decode(json) do
-      {:ok, %{"choices" => [%{"delta" => %{"content" => content}} | _]}}
-      when is_binary(content) and content != "" ->
-        [content]
+      {:ok, %{} = data} ->
+        remember_stream_usage(data["usage"])
+        content_chunks(data)
 
       _ ->
         []
+    end
+  end
+
+  defp content_chunks(%{"choices" => [%{"delta" => %{"content" => content}} | _]})
+       when is_binary(content) and content != "",
+       do: [content]
+
+  defp content_chunks(_), do: []
+
+  # The latest usage report wins: OpenAI sends one final chunk, while some
+  # gateways repeat a running total on every chunk.
+  @stream_usage_key :defacto_ai_stream_usage
+
+  defp remember_stream_usage(%{} = usage) do
+    Process.put(@stream_usage_key, {usage["prompt_tokens"], usage["completion_tokens"]})
+  end
+
+  defp remember_stream_usage(_), do: :ok
+
+  defp flush_stream_usage do
+    case Process.delete(@stream_usage_key) do
+      {input, output} -> Telemetry.record_usage(input, output)
+      nil -> :ok
     end
   end
 
