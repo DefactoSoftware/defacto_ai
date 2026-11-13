@@ -136,9 +136,10 @@ defmodule DefactoAI.Telemetry do
     }
   end
 
-  @doc "`:ok` for `{:ok, _}` results, `:error` for everything else."
+  @doc "`:ok` for `:ok` and `{:ok, _}` results, `:error` for everything else."
   @spec result_status(term()) :: :ok | :error
   def result_status({:ok, _}), do: :ok
+  def result_status(:ok), do: :ok
   def result_status(_), do: :error
 
   # Counts are stored as `count + 1`; 0 means "never reported".

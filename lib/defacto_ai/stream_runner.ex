@@ -24,6 +24,7 @@ defmodule DefactoAI.StreamRunner do
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Message
   alias LangChain.Message.ToolCall
+  alias LangChain.TokenUsage
 
   @default_timeout 180_000
 
@@ -77,7 +78,7 @@ defmodule DefactoAI.StreamRunner do
     end
   end
 
-  defp empty_state, do: %{buffer: "", content: "", tool_calls: %{}}
+  defp empty_state, do: %{buffer: "", content: "", tool_calls: %{}, usage: nil}
 
   defp consume(state, data) do
     {lines, buffer} = split_lines(state.buffer <> data)
@@ -106,13 +107,37 @@ defmodule DefactoAI.StreamRunner do
 
   defp apply_line(_, state), do: state
 
-  defp apply_json(state, {:ok, %{"choices" => [%{"delta" => delta} | _]}}) when is_map(delta) do
+  defp apply_json(state, {:ok, %{} = data}) do
+    state
+    |> merge_usage(data["usage"])
+    |> merge_delta(data["choices"])
+  end
+
+  defp apply_json(state, _), do: state
+
+  defp merge_delta(state, [%{"delta" => delta} | _]) when is_map(delta) do
     state
     |> merge_content(delta["content"])
     |> merge_tool_calls(delta["tool_calls"])
   end
 
-  defp apply_json(state, _), do: state
+  defp merge_delta(state, _), do: state
+
+  # With `stream_options: %{include_usage: true}` OpenAI sends one extra
+  # chunk with empty `choices` and a `usage` object. Some gateways repeat a
+  # running total on every chunk, so the latest report wins rather than
+  # being added up.
+  defp merge_usage(state, %{} = usage) do
+    %{
+      state
+      | usage: %TokenUsage{
+          input: usage["prompt_tokens"],
+          output: usage["completion_tokens"]
+        }
+    }
+  end
+
+  defp merge_usage(state, _), do: state
 
   defp merge_content(state, content) when is_binary(content),
     do: %{state | content: state.content <> content}
@@ -145,7 +170,8 @@ defmodule DefactoAI.StreamRunner do
       role: :assistant,
       status: :complete,
       content: if(state.content == "", do: nil, else: state.content),
-      tool_calls: build_tool_calls(state.tool_calls)
+      tool_calls: build_tool_calls(state.tool_calls),
+      metadata: if(state.usage, do: %{usage: state.usage}, else: %{})
     }
   end
 
