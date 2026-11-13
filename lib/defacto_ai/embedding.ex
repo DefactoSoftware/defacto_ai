@@ -20,13 +20,13 @@ defmodule DefactoAI.Embedding do
   @primary_key {:id, :binary_id, autogenerate: true}
 
   schema "embeddings" do
-    field :embeddable_type, :string
-    field :embeddable_id, :string
-    field :embeddable_title, :string
-    field :embedding, Pgvector.Ecto.Vector
-    field :page_number, :integer
-    field :chunk_index, :integer
-    field :chunk_text, :string
+    field(:embeddable_type, :string)
+    field(:embeddable_id, :string)
+    field(:embeddable_title, :string)
+    field(:embedding, Pgvector.Ecto.Vector)
+    field(:page_number, :integer)
+    field(:chunk_index, :integer)
+    field(:chunk_text, :string)
 
     timestamps()
   end

@@ -61,9 +61,7 @@ defmodule DefactoAI.Client.Stub do
       a single error element for `stream_chat`.
     * a 2-arity function `(messages, opts -> any of the above)`.
   """
-  @spec expect_chat(
-          {:ok, binary() | [binary()]} | {:error, term()} | response_fun()
-        ) :: :ok
+  @spec expect_chat({:ok, binary() | [binary()]} | {:error, term()} | response_fun()) :: :ok
   def expect_chat(response)
       when is_function(response, 2) or is_tuple(response) do
     Process.put(@chat_key, response)

@@ -58,7 +58,11 @@ defmodule DefactoAI.Client do
           | {atom(), term()}
         ]
 
-  @callback complete_structured(schema_module :: module(), messages :: [message()], opts :: opts()) ::
+  @callback complete_structured(
+              schema_module :: module(),
+              messages :: [message()],
+              opts :: opts()
+            ) ::
               {:ok, struct()} | {:error, term()}
 
   @callback complete_chat(messages :: [message()], opts :: opts()) ::
