@@ -467,6 +467,103 @@ defmodule DefactoAI.UsageTelemetryTest do
     end
   end
 
+  describe "Heroku-shaped streams, stream_include_usage off" do
+    # Heroku Managed Inference sends `event:` lines, no space after `data:`,
+    # and reports usage on a last chunk whose `choices` is not empty, without
+    # being asked for it with `stream_options`.
+    defp heroku_usage_chunk(prompt, completion) do
+      Jason.encode!(%{
+        id: "chatcmpl-x",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "model-1",
+        choices: [%{delta: %{}, index: 0}],
+        usage: usage(prompt, completion)
+      })
+    end
+
+    defp heroku_content_chunk(delta) do
+      Jason.encode!(%{
+        id: "chatcmpl-x",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "model-1",
+        choices: [%{delta: delta, index: 0}]
+      })
+    end
+
+    defp expect_heroku_sse(bypass, json_chunks) do
+      test_pid = self()
+
+      body =
+        Enum.map_join(json_chunks, &"event:message\ndata:#{&1}\n") <>
+          "event:done\ndata:[DONE]\n"
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, request, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, request})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+    end
+
+    test "stream_chat reports usage from the last chunk", %{bypass: bypass, provider: provider} do
+      expect_heroku_sse(bypass, [
+        heroku_content_chunk(%{content: "Hel"}),
+        heroku_content_chunk(%{content: "lo"}),
+        heroku_usage_chunk(13, 6)
+      ])
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      assert Enum.to_list(stream) == ["Hel", "lo"]
+
+      assert_receive {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+
+      assert %{usage: %{input_tokens: 13, output_tokens: 6}, result: :ok} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "a streamed complete_structured reports usage from the last chunk",
+         %{bypass: bypass, provider: provider} do
+      previous = Application.get_env(:defacto_ai, :chat_stream)
+      Application.put_env(:defacto_ai, :chat_stream, true)
+
+      on_exit(fn ->
+        if is_nil(previous),
+          do: Application.delete_env(:defacto_ai, :chat_stream),
+          else: Application.put_env(:defacto_ai, :chat_stream, previous)
+      end)
+
+      expect_heroku_sse(bypass, [
+        heroku_content_chunk(%{
+          tool_calls: [
+            %{
+              index: 0,
+              id: "call_1",
+              type: "function",
+              function: %{name: "respond", arguments: ~s({"answer":)}
+            }
+          ]
+        }),
+        heroku_content_chunk(%{tool_calls: [%{index: 0, function: %{arguments: ~s("42"})}}]}),
+        heroku_usage_chunk(13, 6)
+      ])
+
+      assert {:ok, %TestSchema{answer: "42"}} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert_receive {:request_body, body}
+      assert %{"stream" => true} = Jason.decode!(body)
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+
+      assert %{usage: %{input_tokens: 13, output_tokens: 6}, result: :ok} =
+               stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+  end
+
   describe "stream_chat/2" do
     defmodule FailingClient do
       @behaviour DefactoAI.Client
