@@ -71,16 +71,25 @@ defmodule DefactoAI.Telemetry do
     :ok
   end
 
-  @doc "Remember which provider and model a call resolved to."
+  @doc """
+  Remember which provider and model a call resolved to.
+
+  Values that do not implement `DefactoAI.Provider` are ignored: telemetry
+  must never make a call fail.
+  """
   @spec record_provider(term()) :: :ok
   def record_provider(provider) do
-    update(fn context ->
-      %{
-        context
-        | provider: label(DefactoAI.Provider.provider_type(provider)),
-          model: label(DefactoAI.Provider.model(provider))
-      }
-    end)
+    if DefactoAI.Provider.impl_for(provider) do
+      update(fn context ->
+        %{
+          context
+          | provider: label(DefactoAI.Provider.provider_type(provider)),
+            model: label(DefactoAI.Provider.model(provider))
+        }
+      end)
+    else
+      :ok
+    end
   end
 
   @doc """
