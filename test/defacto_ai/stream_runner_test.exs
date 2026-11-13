@@ -306,4 +306,46 @@ defmodule DefactoAI.StreamRunnerTest do
                StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
     end
   end
+
+  describe "run/2 — usage" do
+    test "usage is kept when tool-call arguments arrive on index-less deltas" do
+      stub_sse([
+        opening_chunk(1, "call_1", "respond"),
+        delta(%{tool_calls: [%{function: %{name: "", arguments: ~s({"a":)}}]}),
+        delta(%{tool_calls: [%{function: %{name: "", arguments: "1}"}}]}),
+        Jason.encode!(%{choices: [], usage: %{prompt_tokens: 9, completion_tokens: 4}})
+      ])
+
+      assert {:ok, %LLMChain{last_message: message}} =
+               StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+
+      assert [%ToolCall{name: "respond", arguments: %{"a" => 1}}] = message.tool_calls
+      assert %LangChain.TokenUsage{input: 9, output: 4} = message.metadata.usage
+    end
+
+    test "a usage-only frame is not logged as an unrecognised frame" do
+      stub_sse([
+        opening_chunk(0, "call_1", "respond"),
+        Jason.encode!(%{choices: [], usage: %{prompt_tokens: 1, completion_tokens: 1}})
+      ])
+
+      log =
+        capture_log([level: :info], fn ->
+          StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+        end)
+
+      assert log =~ "unrecognised=0"
+    end
+
+    test "a non-200 response carries its error body and no usage" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        Plug.Conn.send_resp(conn, 422, @error_body)
+      end)
+
+      assert {:error, _chain, {:api_error, 422, body}} =
+               StreamRunner.run(chain(), plug: {Req.Test, __MODULE__})
+
+      assert body =~ "failed to fetch image"
+    end
+  end
 end
