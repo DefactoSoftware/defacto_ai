@@ -109,6 +109,8 @@ defmodule DefactoAI.Embeddings.Client do
 
       case Req.post(req_opts) do
         {:ok, %Req.Response{status: 200, body: body}} ->
+          record_usage(body)
+
           case parse_success(body) do
             {:ok, [embedding]} -> {:ok, embedding}
             {:ok, _} -> {:error, :unexpected_response}
@@ -132,6 +134,29 @@ defmodule DefactoAI.Embeddings.Client do
       end
     end
   end
+
+  # Embedding endpoints report `prompt_tokens` (and `total_tokens`) but no
+  # completion tokens, so the output side stays nil.
+  defp record_usage(body) do
+    case decode_body(body) do
+      %{"usage" => %{"prompt_tokens" => input}} when is_integer(input) ->
+        DefactoAI.Telemetry.record_usage(input, nil)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp decode_body(body) when is_map(body), do: body
+
+  defp decode_body(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> decoded
+      _ -> nil
+    end
+  end
+
+  defp decode_body(_), do: nil
 
   defp report_api_error(status, response_body, sanitized_text, url) do
     Logger.warning("DefactoAI: embedding API error: status=#{status}")

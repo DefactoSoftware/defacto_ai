@@ -24,6 +24,7 @@ defmodule DefactoAI.Embeddings do
 
   alias DefactoAI.Embedding
   alias DefactoAI.Embeddings.{Chunker, Client}
+  alias DefactoAI.Telemetry
 
   # Stays in sync with the upstream API limit. The chunker uses 1200 to
   # leave buffer for encoding overhead; we cap single (unchunked) inputs
@@ -36,21 +37,54 @@ defmodule DefactoAI.Embeddings do
 
   Delegates to `DefactoAI.Embeddings.Client.embed/2`. Wrapped in a
   telemetry span (`[:defacto_ai, :embed, :start | :stop | :exception]`)
-  so hosts can observe per-request durations.
+  so hosts can observe per-request durations. The stop metadata also
+  carries `provider`, `model`, `role`, `usage`, `result` and `tags`; see
+  the README's Telemetry section.
+
+  Accepts `telemetry_tags:` (a map) which is passed through to the event
+  metadata and never sent to the provider.
   """
   def embed(text, opts \\ []) do
-    :telemetry.span([:defacto_ai, :embed], %{}, fn ->
-      {Client.embed(text, opts), %{}}
+    {tags, opts} = pop_tags(opts)
+    role = Keyword.get(opts, :role, :embedding)
+
+    :telemetry.span([:defacto_ai, :embed], %{role: role, tags: tags}, fn ->
+      {result, context} =
+        Telemetry.track(fn -> Client.embed(text, opts) end, provider: opts[:provider])
+
+      {result, stop_metadata(context, result, role, tags, %{})}
     end)
   end
 
   @doc """
   Generate embeddings for multiple texts.
+
+  Telemetry works as for `embed/2`, under `[:defacto_ai, :embed_batch]`,
+  with an extra `count` key. `usage` is summed over all texts.
   """
   def embed_batch(texts, opts \\ []) do
-    :telemetry.span([:defacto_ai, :embed_batch], %{count: length(texts)}, fn ->
-      {Client.embed_batch(texts, opts), %{count: length(texts)}}
+    {tags, opts} = pop_tags(opts)
+    role = Keyword.get(opts, :role, :embedding)
+    count = length(texts)
+
+    :telemetry.span([:defacto_ai, :embed_batch], %{count: count, role: role, tags: tags}, fn ->
+      {result, context} =
+        Telemetry.track(fn -> Client.embed_batch(texts, opts) end, provider: opts[:provider])
+
+      {result, stop_metadata(context, result, role, tags, %{count: count})}
     end)
+  end
+
+  defp pop_tags(opts) do
+    {tags, opts} = Keyword.pop(opts, :telemetry_tags, %{})
+    {Map.new(tags), opts}
+  end
+
+  defp stop_metadata(context, result, role, tags, extra) do
+    context
+    |> Telemetry.info()
+    |> Map.merge(%{result: Telemetry.result_status(result), role: role, tags: tags})
+    |> Map.merge(extra)
   end
 
   @doc """

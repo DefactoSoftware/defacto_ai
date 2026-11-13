@@ -9,6 +9,7 @@ defmodule DefactoAI.UsageTelemetryTest do
   use ExUnit.Case, async: false
 
   alias DefactoAI.Client
+  alias DefactoAI.Embeddings
   alias DefactoAI.TestProvider
 
   @events [
@@ -339,6 +340,130 @@ defmodule DefactoAI.UsageTelemetryTest do
 
       assert %{result: :error, usage: %{input_tokens: nil, output_tokens: nil}} =
                stop_metadata([:defacto_ai, :complete_chat, :stop])
+    end
+  end
+
+  describe "embed/2 and embed_batch/2" do
+    setup do
+      Req.Test.set_req_test_to_private()
+      :ok
+    end
+
+    defp stub_embeddings(usage) do
+      test_pid = self()
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+
+        reply =
+          %{data: [%{index: 0, embedding: [0.1, 0.2]}], model: "model-1"}
+          |> then(fn reply -> if usage, do: Map.put(reply, :usage, usage), else: reply end)
+
+        Req.Test.json(conn, reply)
+      end)
+    end
+
+    test "embed stop metadata carries provider, model, role, usage, result and tags",
+         %{provider: provider} do
+      stub_embeddings(%{prompt_tokens: 8, total_tokens: 8})
+
+      assert {:ok, [0.1, 0.2]} =
+               Embeddings.embed("hello there",
+                 provider: provider,
+                 plug: {Req.Test, __MODULE__},
+                 telemetry_tags: %{feature: :search}
+               )
+
+      assert %{
+               provider: "acme",
+               model: "model-1",
+               role: :embedding,
+               usage: %{input_tokens: 8, output_tokens: nil},
+               result: :ok,
+               tags: %{feature: :search}
+             } = stop_metadata([:defacto_ai, :embed, :stop])
+    end
+
+    test "embed usage is nil when the provider reports none", %{provider: provider} do
+      stub_embeddings(nil)
+
+      assert {:ok, _} =
+               Embeddings.embed("hello there", provider: provider, plug: {Req.Test, __MODULE__})
+
+      assert %{usage: %{input_tokens: nil, output_tokens: nil}, tags: tags} =
+               stop_metadata([:defacto_ai, :embed, :stop])
+
+      assert tags == %{}
+    end
+
+    test "embed tags are not sent to the provider", %{provider: provider} do
+      stub_embeddings(nil)
+
+      Embeddings.embed("hello there",
+        provider: provider,
+        plug: {Req.Test, __MODULE__},
+        telemetry_tags: %{feature: :secret_feature_name}
+      )
+
+      assert_receive {:request_body, body}
+      refute body =~ "telemetry_tags"
+      refute body =~ "secret_feature_name"
+    end
+
+    test "embed error result", %{provider: provider} do
+      Req.Test.stub(__MODULE__, fn conn -> Plug.Conn.send_resp(conn, 500, "nope") end)
+
+      assert {:error, {:api_error, 500, _}} =
+               Embeddings.embed("hello there", provider: provider, plug: {Req.Test, __MODULE__})
+
+      assert %{result: :error, usage: %{input_tokens: nil, output_tokens: nil}} =
+               stop_metadata([:defacto_ai, :embed, :stop])
+    end
+
+    test "embed_batch sums usage over the texts and keeps count", %{provider: provider} do
+      stub_embeddings(%{prompt_tokens: 5, total_tokens: 5})
+
+      assert {:ok, [_, _, _]} =
+               Embeddings.embed_batch(["one", "two", "three"],
+                 provider: provider,
+                 plug: {Req.Test, __MODULE__},
+                 telemetry_tags: %{feature: :indexing}
+               )
+
+      assert %{
+               count: 3,
+               provider: "acme",
+               model: "model-1",
+               usage: %{input_tokens: 15, output_tokens: nil},
+               result: :ok,
+               tags: %{feature: :indexing}
+             } = stop_metadata([:defacto_ai, :embed_batch, :stop])
+    end
+
+    test "embed_batch error result keeps the usage of texts that succeeded",
+         %{provider: provider} do
+      counter = :atomics.new(1, [])
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        if :atomics.add_get(counter, 1, 1) == 1 do
+          Req.Test.json(conn, %{
+            data: [%{index: 0, embedding: [0.1]}],
+            usage: %{prompt_tokens: 4, total_tokens: 4}
+          })
+        else
+          Plug.Conn.send_resp(conn, 500, "nope")
+        end
+      end)
+
+      assert {:error, _} =
+               Embeddings.embed_batch(["one", "two"],
+                 provider: provider,
+                 plug: {Req.Test, __MODULE__}
+               )
+
+      assert %{result: :error, count: 2, usage: %{input_tokens: 4, output_tokens: nil}} =
+               stop_metadata([:defacto_ai, :embed_batch, :stop])
     end
   end
 end
