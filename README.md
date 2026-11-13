@@ -71,7 +71,7 @@ All keys:
 | `:provider_resolver` | — (required unless every call passes `provider:`) | 1-arity function `(role -> struct)`. Returns a struct that implements `DefactoAI.Provider`, or `nil` if no provider is configured for that role. |
 | `:client` | `DefactoAI.Client.LangChain` | Implementation of the `Client` behaviour. Tests set this to `DefactoAI.Client.Stub`. |
 | `:chat_stream` | `false` | Whether `LangChainAdapter` builds streaming chat models by default. Flip to `true` if your gateway times out long non-streamed completions. |
-| `:stream_include_usage` | `false` | Send `stream_options: %{include_usage: true}` on streamed requests so the provider reports token usage. Off by default because providers that do not know the option may reject the request. See [Telemetry](#telemetry). |
+| `:stream_include_usage` | `false` | Send `stream_options: %{include_usage: true}` on streamed requests so the provider reports token usage. Off by default because providers that do not know the option may reject the request, and some providers report usage without it. See [Telemetry](#telemetry). |
 | `:default_strategies` | `[ToolCall, JsonMode, TextRepair]` | Order of structured-output strategies to try. |
 | `:error_reporter` | `nil` | 2-arity function `(title, extras_map -> :ok)`. Called when the embeddings client encounters HTTP/API errors. Useful for Sentry integration; safe to leave unset. |
 | `:embedding_rate_limit` | `450` | Embeddings per minute. |
@@ -342,19 +342,25 @@ on to the schema changeset.
   - **`stream_chat`.** The `usage` object in the SSE chunks, when the provider
     sends one. Otherwise `input_tokens` and `output_tokens` stay `nil`.
 
-Streaming providers send usage when asked for it with
-`stream_options: %{include_usage: true}`. Providers that do not know that
-option may reject the whole request, so the library does not send it unless
-you turn it on:
+Providers differ on streamed usage. OpenAI only sends it when asked with
+`stream_options: %{include_usage: true}`. Some providers report it without
+being asked: Heroku Managed Inference returns a `usage` object in the last
+SSE chunk of a streamed chat completion with or without the option (verified
+2026-11-13). The library reads usage from the stream whenever a provider
+sends it, so for those providers it is safe to leave `:stream_include_usage`
+unset.
+
+Turn `:stream_include_usage` on only when the providers you stream from follow
+OpenAI's opt-in behaviour. Providers that do not know the option may reject
+the whole request, so the library does not send it unless you configure it:
 
 ```elixir
 config :defacto_ai, stream_include_usage: true
 ```
 
 This applies to `stream_chat/2` and, when `:chat_stream` is `true`,
-to streamed structured calls. The setting is global: turn it on only when
-every provider you stream from accepts the option. Usage is read from the
-stream whenever a provider sends it, even with the setting off.
+to streamed structured calls. The key is global: turn it on only when
+every provider you stream from accepts `stream_options`.
 
 ### `stream_chat` events
 
