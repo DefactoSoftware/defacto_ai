@@ -75,7 +75,10 @@ defmodule DefactoAI.UsageTelemetryTest do
     do: %{prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion}
 
   defp tool_call_body(answer, usage) do
-    args = if answer, do: %{answer: answer}, else: %{}
+    # A `nil` answer is a non-empty payload that fails validation. (An empty
+    # `%{}` is treated as "nothing usable" and falls back to the next
+    # strategy instead of spending the repair budget.)
+    args = %{answer: answer}
 
     %{
       id: "chatcmpl-test",
@@ -833,6 +836,76 @@ defmodule DefactoAI.UsageTelemetryTest do
 
       assert %{usage: %{input_tokens: nil, output_tokens: nil}} =
                stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+
+    test "usage is reported for a tool call assembled from index-less deltas",
+         %{bypass: bypass, provider: provider} do
+      Application.put_env(:defacto_ai, :stream_include_usage, true)
+      on_exit(fn -> Application.delete_env(:defacto_ai, :stream_include_usage) end)
+
+      call_delta = fn call ->
+        Jason.encode!(%{choices: [%{delta: %{tool_calls: [call]}}]})
+      end
+
+      sse(bypass, [
+        call_delta.(%{id: "c1", function: %{name: "respond", arguments: ""}}),
+        call_delta.(%{function: %{name: "", arguments: ~s({"answer":)}}),
+        call_delta.(%{function: %{name: "", arguments: ~s("7"})}}),
+        Jason.encode!(%{choices: [], usage: usage(30, 8)})
+      ])
+
+      assert {:ok, %TestSchema{answer: "7"}} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert %{usage: %{input_tokens: 30, output_tokens: 8}, result: :ok} =
+               stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+
+    test "usage of a streamed round that fell back is still counted",
+         %{bypass: bypass, provider: provider} do
+      Application.put_env(:defacto_ai, :stream_include_usage, true)
+      on_exit(fn -> Application.delete_env(:defacto_ai, :stream_include_usage) end)
+
+      # A tool call that never receives arguments and no content: the tool
+      # strategy falls back, and every round (ToolCall, JsonMode, TextRepair)
+      # was billed.
+      sse(bypass, [
+        Jason.encode!(%{
+          choices: [
+            %{delta: %{tool_calls: [%{id: "c1", function: %{name: "respond", arguments: ""}}]}}
+          ]
+        }),
+        Jason.encode!(%{choices: [], usage: usage(4, 1)})
+      ])
+
+      assert {:error, _} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert %{usage: %{input_tokens: 12, output_tokens: 3}, result: :error} =
+               stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+
+    test "a non-200 streaming response is an error result with provider and model",
+         %{bypass: bypass, provider: provider} do
+      body = Jason.encode!(%{error: %{message: "failed to fetch image", type: "unprocessable"}})
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(422, body)
+      end)
+
+      assert {:error, {:api_error, 422, error_body}} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert error_body =~ "failed to fetch image"
+
+      assert %{
+               result: :error,
+               provider: "acme",
+               model: "model-1",
+               usage: %{input_tokens: nil, output_tokens: nil}
+             } = stop_metadata([:defacto_ai, :complete_structured, :stop])
     end
   end
 end
