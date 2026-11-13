@@ -68,7 +68,12 @@ defmodule DefactoAI.StrategyTest do
       end
 
       {:ok, chain} =
-        Strategy.ToolCall.prepare(TestProvider.new(), SchemaWithTopLevelDescription, messages(), [])
+        Strategy.ToolCall.prepare(
+          TestProvider.new(),
+          SchemaWithTopLevelDescription,
+          messages(),
+          []
+        )
 
       [%Function{description: tool_desc, parameters_schema: params}] = chain.tools
 

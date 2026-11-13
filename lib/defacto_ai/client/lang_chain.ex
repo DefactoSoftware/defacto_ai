@@ -80,7 +80,10 @@ defmodule DefactoAI.Client.LangChain do
 
       {:error, :unsupported} = error ->
         log_fallback(strategy, error)
-        try_strategies(rest, provider, schema, messages, budget, opts, [{strategy, error} | errors])
+
+        try_strategies(rest, provider, schema, messages, budget, opts, [
+          {strategy, error} | errors
+        ])
 
       {:error, _} = error ->
         error

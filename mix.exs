@@ -11,7 +11,8 @@ defmodule DefactoAI.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Shared LLM, embeddings and similarity-search building blocks for Defacto apps.",
+      description:
+        "Shared LLM, embeddings and similarity-search building blocks for Defacto apps.",
       package: package()
     ]
   end

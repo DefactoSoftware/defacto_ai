@@ -68,7 +68,8 @@ defmodule DefactoAI.ClientTest do
 
   test "default role is not added when an explicit :provider is given" do
     Stub.expect(TestSchema, fn _msgs, opts ->
-      {:ok, %TestSchema{value: "role=#{inspect(opts[:role])} provider=#{inspect(opts[:provider])}"}}
+      {:ok,
+       %TestSchema{value: "role=#{inspect(opts[:role])} provider=#{inspect(opts[:provider])}"}}
     end)
 
     {:ok, %TestSchema{value: result}} =
@@ -152,6 +153,7 @@ defmodule DefactoAI.ClientTest do
       Stub.expect(TestSchema, {:ok, %TestSchema{value: "ok"}})
 
       ref = make_ref()
+
       :telemetry.attach_many(
         "test-#{inspect(ref)}",
         [
@@ -166,7 +168,8 @@ defmodule DefactoAI.ClientTest do
 
       Client.complete_structured(TestSchema, [%{role: "user", content: "x"}])
 
-      assert_received {:telemetry, [:defacto_ai, :complete_structured, :start], _, %{schema: TestSchema}}
+      assert_received {:telemetry, [:defacto_ai, :complete_structured, :start], _,
+                       %{schema: TestSchema}}
 
       assert_received {:telemetry, [:defacto_ai, :complete_structured, :stop], %{duration: _},
                        %{schema: TestSchema}}

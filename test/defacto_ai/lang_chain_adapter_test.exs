@@ -13,7 +13,11 @@ defmodule DefactoAI.LangChainAdapterTest do
     end
 
     test "trims a trailing slash on base_url before joining" do
-      chat = LangChainAdapter.build_chat_model(TestProvider.new(%{base_url: "https://api.example.com/"}))
+      chat =
+        LangChainAdapter.build_chat_model(
+          TestProvider.new(%{base_url: "https://api.example.com/"})
+        )
+
       assert chat.endpoint == "https://api.example.com/v1/chat/completions"
     end
 

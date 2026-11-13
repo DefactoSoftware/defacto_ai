@@ -16,7 +16,8 @@ defmodule DefactoAI.Strategy.TextRepair do
   def prepare(provider, schema_module, messages, _opts) do
     chat_model = LangChainAdapter.build_chat_model(provider)
 
-    chain = LangChainAdapter.build_chain(chat_model, prepend_system_prompt(messages, schema_module))
+    chain =
+      LangChainAdapter.build_chain(chat_model, prepend_system_prompt(messages, schema_module))
 
     {:ok, chain}
   end
