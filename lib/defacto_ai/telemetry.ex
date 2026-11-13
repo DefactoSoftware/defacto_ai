@@ -79,17 +79,15 @@ defmodule DefactoAI.Telemetry do
   """
   @spec record_provider(term()) :: :ok
   def record_provider(provider) do
-    if DefactoAI.Provider.impl_for(provider) do
-      update(fn context ->
-        %{
-          context
-          | provider: label(DefactoAI.Provider.provider_type(provider)),
-            model: label(DefactoAI.Provider.model(provider))
-        }
-      end)
-    else
-      :ok
-    end
+    update(fn context ->
+      %{
+        context
+        | provider: label(DefactoAI.Provider.provider_type(provider)),
+          model: label(DefactoAI.Provider.model(provider))
+      }
+    end)
+  rescue
+    Protocol.UndefinedError -> :ok
   end
 
   @doc """

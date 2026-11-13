@@ -155,7 +155,10 @@ defmodule DefactoAI.Client do
 
         :telemetry.execute(
           event ++ [:exception],
-          %{duration: System.monotonic_time() - started_at},
+          %{
+            duration: System.monotonic_time() - started_at,
+            monotonic_time: System.monotonic_time()
+          },
           %{role: role, tags: tags, kind: kind, reason: reason, stacktrace: stacktrace}
         )
 
@@ -237,7 +240,7 @@ defmodule DefactoAI.Client do
 
     :telemetry.execute(
       [:defacto_ai, :stream_chat, :exception],
-      %{duration: System.monotonic_time() - started_at},
+      %{duration: System.monotonic_time() - started_at, monotonic_time: System.monotonic_time()},
       metadata
     )
   end
