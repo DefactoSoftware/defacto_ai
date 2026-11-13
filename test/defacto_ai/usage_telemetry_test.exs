@@ -466,4 +466,276 @@ defmodule DefactoAI.UsageTelemetryTest do
                stop_metadata([:defacto_ai, :embed_batch, :stop])
     end
   end
+
+  describe "stream_chat/2" do
+    defmodule FailingClient do
+      @behaviour DefactoAI.Client
+
+      def complete_structured(_, _, _), do: {:error, :unused}
+      def complete_chat(_, _), do: {:error, :unused}
+
+      def stream_chat(_messages, opts) do
+        case Keyword.fetch!(opts, :mode) do
+          :create_error -> {:error, :no_provider}
+          :raise_on_create -> raise "cannot start"
+          :raise_while_streaming -> {:ok, Stream.map(["a", "b"], fn _ -> raise "mid-stream" end)}
+        end
+      end
+    end
+
+    defp chunk(content) do
+      Jason.encode!(%{choices: [%{index: 0, delta: %{content: content}, finish_reason: nil}]})
+    end
+
+    defp usage_chunk(prompt, completion) do
+      Jason.encode!(%{choices: [], usage: usage(prompt, completion)})
+    end
+
+    defp expect_sse(bypass, json_chunks, status \\ 200) do
+      test_pid = self()
+
+      body =
+        Enum.map_join(json_chunks, &"data: #{&1}\n\n") <> "data: [DONE]\n\n"
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, request, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, request})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(status, body)
+      end)
+    end
+
+    defp with_config(key, value) do
+      previous = Application.get_env(:defacto_ai, key)
+      Application.put_env(:defacto_ai, key, value)
+
+      on_exit(fn ->
+        if is_nil(previous),
+          do: Application.delete_env(:defacto_ai, key),
+          else: Application.put_env(:defacto_ai, key, previous)
+      end)
+    end
+
+    test "start fires when the stream is created, stop when it is consumed",
+         %{bypass: bypass, provider: provider} do
+      expect_sse(bypass, [chunk("Hel"), chunk("lo")])
+
+      assert {:ok, stream} =
+               Client.stream_chat(messages(),
+                 provider: provider,
+                 telemetry_tags: %{feature: :chatty}
+               )
+
+      assert_received {:telemetry, [:defacto_ai, :stream_chat, :start],
+                       %{monotonic_time: _, system_time: _}, %{tags: %{feature: :chatty}}}
+
+      refute_received {:telemetry, [:defacto_ai, :stream_chat, :stop], _, _}
+
+      assert Enum.to_list(stream) == ["Hel", "lo"]
+
+      assert %{
+               provider: "acme",
+               model: "model-1",
+               result: :ok,
+               tags: %{feature: :chatty}
+             } = stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "usage is requested and reported when stream_include_usage is on",
+         %{bypass: bypass, provider: provider} do
+      with_config(:stream_include_usage, true)
+      expect_sse(bypass, [chunk("Hi"), usage_chunk(12, 3)])
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      assert Enum.to_list(stream) == ["Hi"]
+
+      assert_receive {:request_body, body}
+      assert %{"stream_options" => %{"include_usage" => true}} = Jason.decode!(body)
+
+      assert %{usage: %{input_tokens: 12, output_tokens: 3}, result: :ok} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "the latest usage report wins when a gateway repeats running totals",
+         %{bypass: bypass, provider: provider} do
+      with_config(:stream_include_usage, true)
+
+      expect_sse(bypass, [
+        Jason.encode!(%{
+          choices: [%{index: 0, delta: %{content: "a"}}],
+          usage: usage(10, 1)
+        }),
+        Jason.encode!(%{
+          choices: [%{index: 0, delta: %{content: "b"}}],
+          usage: usage(10, 2)
+        })
+      ])
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      Enum.to_list(stream)
+
+      assert %{usage: %{input_tokens: 10, output_tokens: 2}} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "stream_options is not sent by default and usage stays nil",
+         %{bypass: bypass, provider: provider} do
+      expect_sse(bypass, [chunk("Hi")])
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      Enum.to_list(stream)
+
+      assert_receive {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+
+      assert %{usage: %{input_tokens: nil, output_tokens: nil}, result: :ok} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "tags are not sent to the provider", %{bypass: bypass, provider: provider} do
+      expect_sse(bypass, [chunk("Hi")])
+
+      {:ok, stream} =
+        Client.stream_chat(messages(),
+          provider: provider,
+          telemetry_tags: %{feature: :secret_feature_name}
+        )
+
+      Enum.to_list(stream)
+
+      assert_receive {:request_body, body}
+      refute body =~ "telemetry_tags"
+      refute body =~ "secret_feature_name"
+    end
+
+    test "an upstream error is an error result", %{bypass: bypass, provider: provider} do
+      Bypass.expect_once(bypass, "POST", "/v1/chat/completions", fn conn ->
+        Plug.Conn.resp(conn, 500, Jason.encode!(%{error: %{message: "boom"}}))
+      end)
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      assert [{:error, {:api_error, 500, _}}] = Enum.to_list(stream)
+
+      assert %{result: :error, usage: %{input_tokens: nil, output_tokens: nil}} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "halting the stream early still emits stop once", %{bypass: bypass, provider: provider} do
+      expect_sse(bypass, [chunk("a"), chunk("b"), chunk("c")])
+
+      {:ok, stream} = Client.stream_chat(messages(), provider: provider)
+      assert Enum.take(stream, 1) == ["a"]
+
+      assert %{result: :ok} = stop_metadata([:defacto_ai, :stream_chat, :stop])
+      refute_receive {:telemetry, [:defacto_ai, :stream_chat, :stop], _, _}, 50
+    end
+
+    test "a stream that cannot be created is an error result" do
+      with_config(:client, FailingClient)
+
+      assert {:error, :no_provider} = Client.stream_chat(messages(), mode: :create_error)
+
+      assert_received {:telemetry, [:defacto_ai, :stream_chat, :start], _, _}
+
+      assert %{result: :error, role: :llm, tags: %{}} =
+               stop_metadata([:defacto_ai, :stream_chat, :stop])
+    end
+
+    test "an exception while creating the stream emits :exception" do
+      with_config(:client, FailingClient)
+
+      assert_raise RuntimeError, "cannot start", fn ->
+        Client.stream_chat(messages(), mode: :raise_on_create)
+      end
+
+      assert_receive {:telemetry, [:defacto_ai, :stream_chat, :exception], %{duration: _},
+                      %{kind: :error, reason: %RuntimeError{}, tags: %{}}}
+    end
+
+    test "an exception while consuming emits :exception and no :stop" do
+      with_config(:client, FailingClient)
+
+      {:ok, stream} = Client.stream_chat(messages(), mode: :raise_while_streaming)
+      assert_raise RuntimeError, "mid-stream", fn -> Enum.to_list(stream) end
+
+      assert_receive {:telemetry, [:defacto_ai, :stream_chat, :exception], %{duration: _},
+                      %{kind: :error, reason: %RuntimeError{}, result: :error}}
+
+      refute_receive {:telemetry, [:defacto_ai, :stream_chat, :stop], _, _}, 50
+    end
+  end
+
+  describe "complete_structured/3 over a streamed response" do
+    defp sse(bypass, json_chunks) do
+      test_pid = self()
+      body = Enum.map_join(json_chunks, &"data: #{&1}\n\n") <> "data: [DONE]\n\n"
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, request, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, request})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+    end
+
+    setup do
+      Application.put_env(:defacto_ai, :chat_stream, true)
+      on_exit(fn -> Application.delete_env(:defacto_ai, :chat_stream) end)
+    end
+
+    defp tool_chunks(usage_chunk) do
+      [
+        Jason.encode!(%{
+          choices: [
+            %{
+              index: 0,
+              delta: %{
+                tool_calls: [
+                  %{
+                    index: 0,
+                    id: "c1",
+                    function: %{name: "respond", arguments: ~s({"answer":"7"})}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      ] ++ usage_chunk
+    end
+
+    test "usage comes from the final usage chunk", %{bypass: bypass, provider: provider} do
+      Application.put_env(:defacto_ai, :stream_include_usage, true)
+      on_exit(fn -> Application.delete_env(:defacto_ai, :stream_include_usage) end)
+
+      sse(bypass, tool_chunks([Jason.encode!(%{choices: [], usage: usage(21, 6)})]))
+
+      assert {:ok, %TestSchema{answer: "7"}} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert_receive {:request_body, body}
+      assert %{"stream_options" => %{"include_usage" => true}} = Jason.decode!(body)
+
+      assert %{usage: %{input_tokens: 21, output_tokens: 6}, result: :ok} =
+               stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+
+    test "usage stays nil and stream_options is not sent by default",
+         %{bypass: bypass, provider: provider} do
+      sse(bypass, tool_chunks([]))
+
+      assert {:ok, %TestSchema{answer: "7"}} =
+               Client.complete_structured(TestSchema, messages(), provider: provider)
+
+      assert_receive {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+
+      assert %{usage: %{input_tokens: nil, output_tokens: nil}} =
+               stop_metadata([:defacto_ai, :complete_structured, :stop])
+    end
+  end
 end

@@ -134,8 +134,112 @@ defmodule DefactoAI.Client do
   """
   @spec stream_chat([message()], opts()) :: {:ok, Enumerable.t()} | {:error, term()}
   def stream_chat(messages, opts \\ []) do
-    opts = default_role(opts, :llm)
-    impl().stream_chat(messages, opts)
+    {tags, opts} = pop_tags(default_role(opts, :llm))
+    role = Keyword.get(opts, :role)
+    event = [:defacto_ai, :stream_chat]
+    started_at = System.monotonic_time()
+
+    :telemetry.execute(
+      event ++ [:start],
+      %{monotonic_time: started_at, system_time: System.system_time()},
+      %{role: role, tags: tags}
+    )
+
+    try do
+      Telemetry.track(fn -> impl().stream_chat(messages, opts) end,
+        provider: Keyword.get(opts, :provider)
+      )
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+
+        :telemetry.execute(
+          event ++ [:exception],
+          %{duration: System.monotonic_time() - started_at},
+          %{role: role, tags: tags, kind: kind, reason: reason, stacktrace: stacktrace}
+        )
+
+        :erlang.raise(kind, reason, stacktrace)
+    else
+      {{:ok, stream}, context} ->
+        {:ok, observe_stream(stream, context, started_at, role, tags)}
+
+      {error, context} ->
+        stop_stream(context, started_at, role, tags, :error)
+        error
+    end
+  end
+
+  # Wraps `stream` so the stop (or exception) event fires when the consumer
+  # finishes, halts early, or the underlying enumerable raises. Elements are
+  # passed through untouched.
+  defp observe_stream(stream, context, started_at, role, tags) do
+    Stream.resource(
+      fn ->
+        {:suspended, nil, continuation} =
+          Enumerable.reduce(stream, {:suspend, nil}, fn element, _ -> {:suspend, element} end)
+
+        %{continuation: continuation, result: :ok, finished: false, ref: make_ref()}
+      end,
+      fn
+        %{finished: true} = state ->
+          {:halt, state}
+
+        %{continuation: continuation, ref: ref} = state ->
+          try do
+            continuation.({:cont, nil})
+          catch
+            kind, reason ->
+              stacktrace = __STACKTRACE__
+              emit_stream_exception(context, started_at, role, tags, kind, reason, stacktrace)
+              # Stream.resource still runs the cleanup function after a
+              # raise; this tells it the exception event already went out.
+              Process.put({:defacto_stream_raised, ref}, true)
+              :erlang.raise(kind, reason, stacktrace)
+          else
+            {:suspended, {:error, _} = element, continuation} ->
+              {[element], %{state | continuation: continuation, result: :error}}
+
+            {:suspended, element, continuation} ->
+              {[element], %{state | continuation: continuation}}
+
+            {_done_or_halted, _acc} ->
+              {:halt, %{state | finished: true}}
+          end
+      end,
+      fn %{continuation: continuation, ref: ref} = state ->
+        if Process.delete({:defacto_stream_raised, ref}) do
+          :ok
+        else
+          # Let the underlying stream run its own cleanup (e.g. stop the request).
+          unless state.finished, do: continuation.({:halt, nil})
+          stop_stream(context, started_at, role, tags, state.result)
+        end
+      end
+    )
+  end
+
+  defp stop_stream(context, started_at, role, tags, result) do
+    metadata = stop_metadata(context, result, role, tags, %{})
+
+    :telemetry.execute(
+      [:defacto_ai, :stream_chat, :stop],
+      %{duration: System.monotonic_time() - started_at, monotonic_time: System.monotonic_time()},
+      metadata
+    )
+  end
+
+  defp emit_stream_exception(context, started_at, role, tags, kind, reason, stacktrace) do
+    metadata =
+      context
+      |> stop_metadata(:error, role, tags, %{})
+      |> Map.merge(%{kind: kind, reason: reason, stacktrace: stacktrace})
+
+    :telemetry.execute(
+      [:defacto_ai, :stream_chat, :exception],
+      %{duration: System.monotonic_time() - started_at},
+      metadata
+    )
   end
 
   # `:telemetry_tags` is for telemetry handlers only. It is removed here so
