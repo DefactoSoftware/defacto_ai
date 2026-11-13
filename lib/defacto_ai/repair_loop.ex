@@ -13,6 +13,7 @@ defmodule DefactoAI.RepairLoop do
   require Logger
 
   alias DefactoAI.JSON
+  alias DefactoAI.Telemetry
   alias LangChain.Chains.LLMChain
   alias LangChain.LangChainError
   alias LangChain.Message
@@ -51,9 +52,11 @@ defmodule DefactoAI.RepairLoop do
       when is_atom(schema_module) and is_function(decode_fun, 1) do
     case run_chain(ensure_message_content(chain), opts) do
       {:ok, new_chain} ->
+        Telemetry.record_message_usage(new_chain.last_message)
         decode_and_validate(new_chain, schema_module, decode_fun, budget, opts)
 
       {:ok, new_chain, _msg} ->
+        Telemetry.record_message_usage(new_chain.last_message)
         decode_and_validate(new_chain, schema_module, decode_fun, budget, opts)
 
       {:error, _chain, %LangChainError{} = err} ->

@@ -23,6 +23,7 @@ defmodule DefactoAI.Client.LangChain do
   alias DefactoAI.Provider
   alias DefactoAI.RepairLoop
   alias DefactoAI.Strategy
+  alias DefactoAI.Telemetry
   alias LangChain.Chains.LLMChain
   alias LangChain.LangChainError
   alias LangChain.Message
@@ -103,7 +104,15 @@ defmodule DefactoAI.Client.LangChain do
       provider ->
         {:ok, provider}
     end
+    |> record_provider()
   end
+
+  defp record_provider({:ok, provider} = result) do
+    Telemetry.record_provider(provider)
+    result
+  end
+
+  defp record_provider(other), do: other
 
   defp resolve_by_role(role) do
     case Application.get_env(:defacto_ai, :provider_resolver) do
@@ -340,13 +349,18 @@ defmodule DefactoAI.Client.LangChain do
   defp http_error_reason(%{reason: reason}), do: reason
   defp http_error_reason(other), do: other
 
-  defp handle_chat_run_result({:ok, %LLMChain{} = chain}), do: extract_content(chain)
-  defp handle_chat_run_result({:ok, %LLMChain{} = chain, _last}), do: extract_content(chain)
+  defp handle_chat_run_result({:ok, %LLMChain{} = chain}), do: finish_chat(chain)
+  defp handle_chat_run_result({:ok, %LLMChain{} = chain, _last}), do: finish_chat(chain)
 
   defp handle_chat_run_result({:error, _chain, %LangChainError{} = err}),
     do: {:error, classify_chat_error(err)}
 
   defp handle_chat_run_result({:error, _chain, other}), do: {:error, other}
+
+  defp finish_chat(%LLMChain{} = chain) do
+    Telemetry.record_message_usage(chain.last_message)
+    extract_content(chain)
+  end
 
   defp extract_content(%LLMChain{last_message: %Message{content: content}})
        when is_binary(content),

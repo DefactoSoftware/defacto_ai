@@ -36,6 +36,8 @@ defmodule DefactoAI.Client do
   wish.
   """
 
+  alias DefactoAI.Telemetry
+
   @typedoc """
   Either a fully-formed `LangChain.Message`, a map with atom-keyed
   `:role` and `:content`, or a map with string-keyed `"role"` and
@@ -51,6 +53,7 @@ defmodule DefactoAI.Client do
 
   @type opts :: [
           {:provider, provider()}
+          | {:telemetry_tags, map()}
           | {:role, role()}
           | {:max_validation_retries, non_neg_integer()}
           | {:strategies, [module()]}
@@ -81,14 +84,19 @@ defmodule DefactoAI.Client do
   """
   @spec complete_structured(module(), [message()], opts()) :: {:ok, struct()} | {:error, term()}
   def complete_structured(schema_module, messages, opts \\ []) do
-    opts = default_role(opts, :llm)
+    {tags, opts} = pop_tags(default_role(opts, :llm))
+    role = Keyword.get(opts, :role)
 
     :telemetry.span(
       [:defacto_ai, :complete_structured],
-      %{schema: schema_module, role: Keyword.get(opts, :role)},
+      %{schema: schema_module, role: role, tags: tags},
       fn ->
-        result = impl().complete_structured(schema_module, messages, opts)
-        {result, %{schema: schema_module}}
+        {result, context} =
+          Telemetry.track(fn -> impl().complete_structured(schema_module, messages, opts) end,
+            provider: Keyword.get(opts, :provider)
+          )
+
+        {result, stop_metadata(context, result, role, tags, %{schema: schema_module})}
       end
     )
   end
@@ -99,14 +107,19 @@ defmodule DefactoAI.Client do
   """
   @spec complete_chat([message()], opts()) :: {:ok, binary()} | {:error, term()}
   def complete_chat(messages, opts \\ []) do
-    opts = default_role(opts, :llm)
+    {tags, opts} = pop_tags(default_role(opts, :llm))
+    role = Keyword.get(opts, :role)
 
     :telemetry.span(
       [:defacto_ai, :complete_chat],
-      %{role: Keyword.get(opts, :role)},
+      %{role: role, tags: tags},
       fn ->
-        result = impl().complete_chat(messages, opts)
-        {result, %{}}
+        {result, context} =
+          Telemetry.track(fn -> impl().complete_chat(messages, opts) end,
+            provider: Keyword.get(opts, :provider)
+          )
+
+        {result, stop_metadata(context, result, role, tags, %{})}
       end
     )
   end
@@ -123,6 +136,20 @@ defmodule DefactoAI.Client do
   def stream_chat(messages, opts \\ []) do
     opts = default_role(opts, :llm)
     impl().stream_chat(messages, opts)
+  end
+
+  # `:telemetry_tags` is for telemetry handlers only. It is removed here so
+  # it can never reach a provider request or a schema changeset.
+  defp pop_tags(opts) do
+    {tags, opts} = Keyword.pop(opts, :telemetry_tags, %{})
+    {Map.new(tags), opts}
+  end
+
+  defp stop_metadata(context, result, role, tags, extra) do
+    context
+    |> Telemetry.info()
+    |> Map.merge(%{result: Telemetry.result_status(result), role: role, tags: tags})
+    |> Map.merge(extra)
   end
 
   defp default_role(opts, role) do
