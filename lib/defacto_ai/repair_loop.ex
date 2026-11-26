@@ -230,16 +230,31 @@ defmodule DefactoAI.RepairLoop do
   defp describe_error(:no_json), do: "the response did not contain any JSON"
   defp describe_error(other), do: "unexpected error (#{inspect(other)})"
 
-  defp format_error_option(value) when is_binary(value) or is_atom(value) or is_number(value),
-    do: to_string(value)
+  defp format_error_option(value) when is_list(value), do: inspect(value)
 
-  defp format_error_option(value), do: inspect(value)
+  defp format_error_option(value) when is_bitstring(value) and not is_binary(value),
+    do: inspect(value)
+
+  defp format_error_option(value) do
+    if String.Chars.impl_for(value), do: to_string(value), else: inspect(value)
+  end
 
   defp format_changeset_errors(map) when is_map(map) do
     map
     |> Enum.map(fn
-      {field, msgs} when is_list(msgs) -> "#{field}: #{Enum.join(msgs, ", ")}"
-      {field, sub} when is_map(sub) -> "#{field} → #{format_changeset_errors(sub)}"
+      {field, [%{} | _] = items} ->
+        items
+        |> Enum.with_index()
+        |> Enum.reject(fn {errors, _index} -> errors == %{} end)
+        |> Enum.map_join("; ", fn {errors, index} ->
+          "#{field}[#{index}] → #{format_changeset_errors(errors)}"
+        end)
+
+      {field, msgs} when is_list(msgs) ->
+        "#{field}: #{Enum.join(msgs, ", ")}"
+
+      {field, sub} when is_map(sub) ->
+        "#{field} → #{format_changeset_errors(sub)}"
     end)
     |> Enum.join("; ")
   end

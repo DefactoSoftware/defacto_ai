@@ -140,6 +140,20 @@ defmodule DefactoAI.RepairLoopTest do
     Enum.find(messages, &(&1["role"] == "assistant"))
   end
 
+  test "preserves Decimal and Date text in error placeholders" do
+    changeset =
+      %TestSchema{}
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.add_error(:answer, "expected %{amount} on %{date}",
+        amount: Decimal.new("1.5"),
+        date: ~D[2026-01-02]
+      )
+
+    [message] = RepairLoop.corrective_messages(chain(), changeset, %{})
+    assert [%{content: text}] = message.content
+    assert text =~ "expected 1.5 on 2026-01-02"
+  end
+
   describe "run/5 — re-sent assistant tool-call turns" do
     test "substitutes a placeholder for nil content when the turn carries tool calls" do
       stub_upstream([~s({"answer":"42"})])

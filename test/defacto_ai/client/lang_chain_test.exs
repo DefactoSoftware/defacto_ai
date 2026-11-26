@@ -73,6 +73,33 @@ defmodule DefactoAI.Client.LangChainTest do
     end
   end
 
+  defmodule ItemList do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      embeds_many :items, Item, primary_key: false do
+        field(:name, :string)
+      end
+    end
+
+    def changeset(struct, attrs, _opts) do
+      struct
+      |> cast(attrs, [])
+      |> cast_embed(:items,
+        with: fn item, data ->
+          item |> cast(data, [:name]) |> validate_required([:name])
+        end
+      )
+    end
+
+    def parameters_schema do
+      item = %{type: "object", properties: %{name: %{type: "string"}}, required: ["name"]}
+      %{type: "object", properties: %{items: %{type: "array", items: item}}, required: ["items"]}
+    end
+  end
+
   defp provider(base_url) do
     TestProvider.new(%{base_url: base_url, api_path: "/v1/chat/completions"})
   end
@@ -144,6 +171,35 @@ defmodule DefactoAI.Client.LangChainTest do
     end)
   end
 
+  defp expect_repair(bypass, invalid, corrected) do
+    test_pid = self()
+    counter = :atomics.new(1, [])
+
+    Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+      {:ok, raw, conn} = Plug.Conn.read_body(conn)
+
+      payload =
+        case :atomics.add_get(counter, 1, 1) do
+          1 ->
+            invalid
+
+          2 ->
+            assert %{"role" => "user", "content" => [%{"text" => text}]} =
+                     List.last(Jason.decode!(raw)["messages"])
+
+            send(test_pid, {:correction, text})
+            corrected
+
+          n ->
+            flunk("Unexpected request #{n} after the corrected response")
+        end
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, openai_tool_call_response(payload))
+    end)
+  end
+
   defp ok(body), do: {200, body, "application/json"}
 
   defp api_error(status, message) do
@@ -161,31 +217,27 @@ defmodule DefactoAI.Client.LangChainTest do
 
     test "sends the array cast error to the model and accepts its correction",
          %{bypass: bypass, base_url: url} do
-      counter = :atomics.new(1, [])
+      expect_repair(bypass, %{sections: "wrong shape"}, %{sections: ["corrected"]})
 
-      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
-        {:ok, raw, conn} = Plug.Conn.read_body(conn)
-
-        sections =
-          case :atomics.add_get(counter, 1, 1) do
-            1 ->
-              "wrong shape"
-
-            2 ->
-              assert %{"role" => "user", "content" => [%{"text" => correction}]} =
-                       List.last(Jason.decode!(raw)["messages"])
-
-              assert correction =~ "sections: is invalid"
-              ["corrected"]
-          end
-
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, openai_tool_call_response(%{sections: sections}))
-      end)
-
+      # Exercise the public entry point where callers observed the exception.
       assert {:ok, %Sections{sections: ["corrected"]}} =
                DefactoAI.Client.complete_structured(Sections, messages(), provider: provider(url))
+
+      assert_received {:correction, text}
+      assert text =~ "sections: is invalid"
+    end
+
+    test "identifies the invalid embedded item in the corrective request",
+         %{bypass: bypass, base_url: url} do
+      first = %{name: "first"}
+      expect_repair(bypass, %{items: [first, %{}]}, %{items: [first, %{name: "second"}]})
+
+      assert {:ok, %ItemList{items: [%{name: "first"}, %{name: "second"}]}} =
+               LangChain.complete_structured(ItemList, messages(), provider: provider(url))
+
+      assert_received {:correction, text}
+      assert text =~ "items[1] → name: can't be blank"
+      refute text =~ "items[0]"
     end
 
     test "errors when no provider given and no resolver configured" do
