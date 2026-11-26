@@ -210,15 +210,7 @@ defmodule DefactoAI.RepairLoop do
   end
 
   defp describe_error(%Ecto.Changeset{} = changeset) do
-    errors =
-      changeset
-      |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
-        Enum.reduce(opts, msg, fn {k, v}, acc ->
-          String.replace(acc, "%{#{k}}", fn _ -> format_error_option(v) end)
-        end)
-      end)
-      |> format_changeset_errors()
-
+    errors = changeset |> changeset_errors("") |> Enum.join("; ")
     "validation failed (#{errors})"
   end
 
@@ -239,25 +231,37 @@ defmodule DefactoAI.RepairLoop do
     if String.Chars.impl_for(value), do: to_string(value), else: inspect(value)
   end
 
-  defp format_changeset_errors(map) when is_map(map) do
-    map
-    |> Enum.map(fn
-      {field, [%{} | _] = items} ->
-        items
-        |> Enum.with_index()
-        |> Enum.reject(fn {errors, _index} -> errors == %{} end)
-        |> Enum.map_join("; ", fn {errors, index} ->
-          "#{field}[#{index}] → #{format_changeset_errors(errors)}"
+  # traverse_errors/2 replaces a relation's own errors with its child errors
+  # when both exist. Collect them separately so the model can fix both at once.
+  defp changeset_errors(changeset, prefix) do
+    fields =
+      changeset.errors
+      |> Enum.group_by(&elem(&1, 0), fn {_field, {message, options}} ->
+        Enum.reduce(options, message, fn {key, value}, text ->
+          String.replace(text, "%{#{key}}", fn _ -> format_error_option(value) end)
         end)
+      end)
+      |> Enum.map(fn {field, messages} -> "#{prefix}#{field}: #{Enum.join(messages, ", ")}" end)
 
-      {field, msgs} when is_list(msgs) ->
-        "#{field}: #{Enum.join(msgs, ", ")}"
+    children =
+      for {field, value} <- changeset.changes,
+          match?({relation, _} when relation in [:embed, :assoc], changeset.types[field]),
+          error <- related_errors(value, "#{prefix}#{field}"),
+          do: error
 
-      {field, sub} when is_map(sub) ->
-        "#{field} → #{format_changeset_errors(sub)}"
-    end)
-    |> Enum.join("; ")
+    fields ++ children
   end
+
+  defp related_errors(items, path) when is_list(items) do
+    for {%Ecto.Changeset{valid?: false} = item, index} <- Enum.with_index(items),
+        error <- changeset_errors(item, "#{path}[#{index}] → "),
+        do: error
+  end
+
+  defp related_errors(%Ecto.Changeset{valid?: false} = child, path),
+    do: changeset_errors(child, "#{path} → ")
+
+  defp related_errors(_value, _path), do: []
 
   defp format_payload(payload) when is_binary(payload), do: payload
   defp format_payload(payload), do: inspect(payload)
