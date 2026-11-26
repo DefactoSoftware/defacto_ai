@@ -50,6 +50,29 @@ defmodule DefactoAI.Client.LangChainTest do
     end
   end
 
+  defmodule Sections do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:sections, {:array, :string}, default: [])
+    end
+
+    def changeset(struct, attrs, _opts) do
+      struct |> cast(attrs, [:sections]) |> validate_required([:sections])
+    end
+
+    def parameters_schema do
+      %{
+        type: "object",
+        properties: %{sections: %{type: "array", items: %{type: "string"}}},
+        required: ["sections"],
+        additionalProperties: false
+      }
+    end
+  end
+
   defp provider(base_url) do
     TestProvider.new(%{base_url: base_url, api_path: "/v1/chat/completions"})
   end
@@ -60,6 +83,7 @@ defmodule DefactoAI.Client.LangChainTest do
     args =
       case answer do
         a when is_binary(a) -> %{answer: a}
+        attrs when is_map(attrs) -> attrs
         :empty -> %{}
         :wrong_key -> %{wrong: "x"}
       end
@@ -133,6 +157,35 @@ defmodule DefactoAI.Client.LangChainTest do
 
       assert {:ok, %TestSchema{answer: "42"}} =
                LangChain.complete_structured(TestSchema, messages(), provider: provider(url))
+    end
+
+    test "sends the array cast error to the model and accepts its correction",
+         %{bypass: bypass, base_url: url} do
+      counter = :atomics.new(1, [])
+
+      Bypass.expect(bypass, "POST", "/v1/chat/completions", fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+
+        sections =
+          case :atomics.add_get(counter, 1, 1) do
+            1 ->
+              "wrong shape"
+
+            2 ->
+              assert %{"role" => "user", "content" => [%{"text" => correction}]} =
+                       List.last(Jason.decode!(raw)["messages"])
+
+              assert correction =~ "sections: is invalid"
+              ["corrected"]
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, openai_tool_call_response(%{sections: sections}))
+      end)
+
+      assert {:ok, %Sections{sections: ["corrected"]}} =
+               DefactoAI.Client.complete_structured(Sections, messages(), provider: provider(url))
     end
 
     test "errors when no provider given and no resolver configured" do
