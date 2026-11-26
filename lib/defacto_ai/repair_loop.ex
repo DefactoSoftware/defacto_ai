@@ -214,7 +214,7 @@ defmodule DefactoAI.RepairLoop do
       changeset
       |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
         Enum.reduce(opts, msg, fn {k, v}, acc ->
-          String.replace(acc, "%{#{k}}", to_string(v))
+          String.replace(acc, "%{#{k}}", fn _ -> format_error_option(v) end)
         end)
       end)
       |> format_changeset_errors()
@@ -229,6 +229,11 @@ defmodule DefactoAI.RepairLoop do
 
   defp describe_error(:no_json), do: "the response did not contain any JSON"
   defp describe_error(other), do: "unexpected error (#{inspect(other)})"
+
+  defp format_error_option(value) when is_binary(value) or is_atom(value) or is_number(value),
+    do: to_string(value)
+
+  defp format_error_option(value), do: inspect(value)
 
   defp format_changeset_errors(map) when is_map(map) do
     map
