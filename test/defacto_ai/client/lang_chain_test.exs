@@ -92,11 +92,17 @@ defmodule DefactoAI.Client.LangChainTest do
           item |> cast(data, [:name]) |> validate_required([:name])
         end
       )
+      |> validate_length(:items, min: 2)
     end
 
     def parameters_schema do
       item = %{type: "object", properties: %{name: %{type: "string"}}, required: ["name"]}
-      %{type: "object", properties: %{items: %{type: "array", items: item}}, required: ["items"]}
+
+      %{
+        type: "object",
+        properties: %{items: %{type: "array", items: item, minItems: 2}},
+        required: ["items"]
+      }
     end
   end
 
@@ -238,6 +244,19 @@ defmodule DefactoAI.Client.LangChainTest do
       assert_received {:correction, text}
       assert text =~ "items[1] → name: can't be blank"
       refute text =~ "items[0]"
+    end
+
+    test "reports collection and item errors together on the first retry",
+         %{bypass: bypass, base_url: url} do
+      corrected = %{items: [%{name: "first"}, %{name: "second"}]}
+      expect_repair(bypass, %{items: [%{}]}, corrected)
+
+      assert {:ok, %ItemList{items: [%{name: "first"}, %{name: "second"}]}} =
+               LangChain.complete_structured(ItemList, messages(), provider: provider(url))
+
+      assert_received {:correction, text}
+      assert text =~ "items: should have at least 2 item(s)"
+      assert text =~ "items[0] → name: can't be blank"
     end
 
     test "errors when no provider given and no resolver configured" do
